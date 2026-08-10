@@ -17,7 +17,11 @@ done
 STATE_PATH="$STATE_ROOT/state.json"
 
 run_launch() {
-  "$LAUNCH_BIN" "$LAUNCH_SCRIPT" "${ARGS[@]}" --no-open
+  if ((${#ARGS[@]} > 0)); then
+    "$LAUNCH_BIN" "$LAUNCH_SCRIPT" "${ARGS[@]}" --no-open
+  else
+    "$LAUNCH_BIN" "$LAUNCH_SCRIPT" --no-open
+  fi
 }
 
 # 首次运行允许 launch-ui 完成安装；恢复操作删除 state.json 后，守护会自然退出。

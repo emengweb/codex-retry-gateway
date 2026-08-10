@@ -16,7 +16,8 @@ try {
   await writeFile(
     fakeLauncher,
     `import { mkdir, rm, writeFile } from "node:fs/promises";\n` +
-      `const stateRoot = process.argv[process.argv.indexOf("--state-root") + 1];\n` +
+      `const stateRootIndex = process.argv.indexOf("--state-root");\n` +
+      `const stateRoot = stateRootIndex >= 0 ? process.argv[stateRootIndex + 1] : process.env.HOME + "/.codex-retry-gateway";\n` +
       `const marker = process.env.WATCHDOG_TEST_MARKER;\n` +
       `await mkdir(stateRoot, { recursive: true });\n` +
       `await writeFile(marker, "launched\\n", { flag: "a" });\n` +
@@ -43,6 +44,27 @@ try {
   });
   const launches = (await readFile(marker, "utf8")).trim().split("\n").filter(Boolean);
   assert.equal(launches.length, 1, "删除 state.json 后守护不应再次启动");
+
+  const noArgsRoot = path.join(tempRoot, "no-args-home");
+  const noArgsMarker = path.join(tempRoot, "no-args-launches.log");
+  const noArgsChild = spawn("bash", [runPath], {
+    cwd: root,
+    env: {
+      ...process.env,
+      HOME: noArgsRoot,
+      LAUNCH_UI_BIN: process.execPath,
+      LAUNCH_UI_SCRIPT: fakeLauncher,
+      WATCHDOG_TEST_MARKER: noArgsMarker,
+      WATCHDOG_TEST_REMOVE_STATE: "1",
+    },
+    stdio: "ignore",
+  });
+  await new Promise((resolve, reject) => {
+    noArgsChild.once("error", reject);
+    noArgsChild.once("exit", (code) => code === 0 ? resolve() : reject(new Error(`no-args exit=${code}`)));
+  });
+  const noArgsLaunches = (await readFile(noArgsMarker, "utf8")).trim().split("\n").filter(Boolean);
+  assert.equal(noArgsLaunches.length, 1, "无参数启动不应触发 Bash 未绑定变量错误");
   console.log("PASS run watchdog state stop");
 } finally {
   await rm(tempRoot, { recursive: true, force: true });
