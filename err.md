@@ -5,6 +5,147 @@
 - 早期排错记录里出现的 `guard_retry_attempts=3` 是历史默认；当前项目默认以 `gateway.mjs`、`config.example.json`、`README.md` 和 `build.md` 为准，默认值已经调整为 `5`。
 - `stream_action=continuation_recovery` 只让 `reasoning_tokens` 主规则命中的 Responses 流式请求进入安全续写；`final_answer_only_high_xhigh` 实验规则即使选择该动作，也只共用 `guard_retry_attempts` 做普通内部重试/最终拦截。
 
+## 2026-08-11 remote compaction v2 被拦截或脱敏后返回零输出 item
+
+### 现象
+
+- Codex 持续报错：`remote compaction v2 expected exactly one compaction output item, got 0 from 0 output items`。
+- 真实请求带 `x-codex-beta-features: remote_compaction_v2` 和 `x-codex-turn-metadata.request_kind=compaction`；若 gateway 把它当普通 turn，或把唯一 item 的 `encrypted_content` 清洗掉，远程压缩协议会收到 0 个有效输出 item。
+
+### 根因
+
+- 旧请求分类只识别 `remote_compaction` / `context_compaction` 文本标记，未解析真实 header JSON 中的 `request_kind=compaction`，因而把远程压缩请求归为普通 turn。
+- 被归为普通 turn 后，`reasoning_tokens=516` 等值会进入普通 reasoning 拦截与续写恢复链路，压缩输出可能被重试、替换或清空。
+- `continuation_recovery` 的 Responses 安全清洗原先不区分请求类型，连 `type=compaction` 的协议 item 也删除 `encrypted_content`；客户端因此无法识别唯一压缩 item。
+
+### 处理
+
+- 对已由显式请求信号识别的 `request_kind=context_compaction` 无条件豁免所有 reasoning 拦截模式。
+- 压缩样本仍完整记录并带 `intercept_exempt_reason=context_compaction`，但不触发 reasoning 内部重试或续写恢复。
+- 从结构化 `x-codex-turn-metadata` / 请求 JSON 的 `request_kind=compaction` 识别真实压缩请求；beta 标记本身仍不构成压缩识别条件，显式标记为普通 turn 的请求继续遵守现有主规则。
+- 压缩请求跳过 `encrypted_content` 响应脱敏，普通请求仍保持原有敏感内容保护。
+
+### 防回归
+
+- `scripts/test-gateway-e2e.mjs` 覆盖 `context_compaction + reasoning_tokens=516`：必须返回 `200`、仅发起一次上游请求、样本不命中规则且标记为压缩豁免。
+- 同一 E2E 还覆盖 `request_kind=compaction` 在 `continuation_recovery` 下保留唯一 `compaction.encrypted_content` item。
+- 验证命令：`node --check .\\gateway.mjs`、`node --check .\\scripts\\test-gateway-e2e.mjs`、`node .\\scripts\\test-gateway-e2e.mjs`。
+
+## 2026-08-11 持续内部重试与严格流缓存导致内存快速上涨
+
+### 现象
+
+- 实机日志出现连续的 `upstream-other-http-4xx ... action=internal_retry`，同一 `/responses` 请求在毫秒级重复派发；配置中曾存在 `guard_retry_attempts=9999`。
+- 管理接口已将运行配置改为安全值后，先前已经进入循环的请求仍持有旧配置对象；进程 RSS 继续升高，健康接口会超时。
+- 严格流式模式会积累完整 SSE 后再决定是否向客户端首写；分析样本每日落盘后也一直保留在 `daily_buffers`，长运行进程会重复占用已写入磁盘的样本内存。
+
+### 根因
+
+- `guard_retry_attempts` 只校验非负整数，没有上限；`transient_retry` 在 `429`、临时 HTTP 错误、连接失败和首写前流式失败上没有请求级尝试次数上限。
+- `strict_502` / `continuation_recovery` 的累计 `bufferedChunks` 没有总字节限制。
+- 分析落盘函数写文件成功后没有释放对应日期的内存数组。
+
+### 处理
+
+- `guard_retry_attempts` 限制为 `0..32`；安装/复用迁移同样会将超过上限的旧值恢复为默认值。
+- `transient_retry` 每个客户端请求最多发起 `16` 次上游尝试；达到上限后不再重放，交给最后一次响应的既有策略处理。
+- 严格流式累计缓存限制为 `8 MiB`，超限且尚未首写时返回 `response_inspection_limit_exceeded` 的 `502`。
+- 每日分析样本在落盘前做快照，成功后释放内存；落盘失败会把快照与期间新增样本合并回缓冲，避免丢样本。
+- 配置保存改为原地更新运行时配置对象，使已经持有该对象的重试循环能读取紧急关闭/收口配置；旧进程未加载此代码时仍必须受控重启。
+
+### 防回归
+
+- `node .\scripts\test-memory-guard.mjs` 覆盖：超过 `32` 的 guard 预算拒绝启动、连续 `429` 在第 `16` 次上游尝试后收口、严格流累计超过 `8 MiB` 返回专用 `502`、分析样本落盘后 `daily_buffers` 清空、管理接口紧急关闭临时重试后在途请求不再沿用旧配置循环。
+- `node --check .\gateway.mjs && node --check .\scripts\test-memory-guard.mjs && git diff --check` 覆盖语法和补丁格式。
+
+## 2026-08-11 Codex 压缩请求必须在网关侧规范化
+
+### 现象
+
+- Codex 的新会话请求可能带 `Content-Encoding: zstd`；旧网关把压缩字节和该头部原样转发，依赖上游再次解码。
+- 上游拒绝这类请求时，现有 `other_http_4xx` 重试策略还会把一次 `400` 放大成大量瞬时失败，导致错误频繁弹出。
+
+### 根因
+
+- `proxyRequest` 在解析 JSON 前没有处理请求体编码，`cloneHeadersForUpstream` 也保留了 `content-encoding`；网关自身无法保证下游使用同一套压缩解码器。
+
+### 处理
+
+- 网关现在对整条已知 `gzip`、`br`、`deflate`、`zstd` 编码链逆序解压，解压后复用同一份 body，并移除 `Content-Encoding` 让上游按 identity 读取。
+- 解压后的 body 仍受 `request_body_limit_bytes` 限制；编码链过深或已识别编码损坏时，网关直接返回 `400 request_content_encoding_invalid`，不派发上游重试。运行时不支持某个编码时保持原请求，避免破坏旧 Node 运行时的既有兼容性。
+
+### 防回归
+
+- `node scripts/test-content-encoding.mjs` 覆盖 zstd 解压转发、移除编码头和 malformed zstd 不转发。
+- `node scripts/test-gateway-e2e.mjs`、`node scripts/test-launch-ui-unix.mjs`、`node --check gateway.mjs` 与 `node --check scripts/test-content-encoding.mjs` 已通过。
+
+## 2026-08-11 上游错误策略必须区分语义、状态码和流式首写边界
+
+### 现象
+
+- 上游可能返回 `{"error":"模型 'gpt-5.6-sol' 未配置或不可用"}`、HTTP `502/503`、其他 `4xx/5xx`，或 HTTP `200` 的 `{ "error": { "message": "..." } }` 错误包络；旧策略只覆盖 Capacity 与 HTTP 429。
+- 流式 `response.failed` 可以在 HTTP `200` 内使用字符串形式的 `response.error`。若在读取前已经向客户端发送响应头，网关无法安全重放该请求。
+
+### 根因
+
+- 旧分类器没有从结构化 `error` 字符串和 `error.message` 提取可独立配置的错误信号，也没有把状态分类排除已拥有专属动作的 429、502、503。
+- 流式首写前的延迟转发只由 `transient_retry` 驱动；关闭它后，即使新策略要求重试，也会先写出 HTTP 200 响应头。
+
+### 处理
+
+- 增加模型未配置/不可用、HTTP 502/503、其他 HTTP 4xx、其他 HTTP 5xx、`error.message` 兜底五项策略，默认均为 `retry_then_pass_through`；保留 Capacity 与 HTTP 429 原有开关和默认值。
+- 保持 `transient_retry` 优先，随后按 Capacity、模型不可用、429、502/503、其他 4xx、其他 5xx、`error.message` 分类；429 不进入其他 4xx，502/503 不进入其他 5xx。
+- 新策略复用 `guard_retry_attempts` 和既有策略延迟；流式仅在未发送头或正文时延迟转发并允许重试，已首写不再重放。
+- 主题持久化扩展为 `light`、`dark`、`system` 三态；旧值兼容，`system` 使用 `prefers-color-scheme` 并监听运行期系统主题变化，不移动或重设主题按钮样式。
+- 复审发现流式策略分类若扫描全部 SSE payload，会把 `response.completed` 的同名 `error.message` 元数据误当失败并触发重放。现在仅在 `response.failed`、`response.error`、`response.incomplete` 等明确失败终态运行策略分类。
+
+### 防回归
+
+- `node .\scripts\test-gateway-e2e.mjs` 覆盖五类非流式新策略、模型不可用 HTTP 200 错误包络、HTTP 429 排除其他 4xx、关闭模型策略后不重放、流式 `response.failed` 首写前模型不可用重试、管理页配置保存和 system 主题三态。
+- E2E 额外覆盖携带 `error.message` 的 `response.completed` 不重试，防止普通 lifecycle 元数据触发错误兜底策略。
+- `node --check .\gateway.mjs` 与 `node --check .\scripts\test-gateway-e2e.mjs` 覆盖主程序和测试脚本语法。
+
+## 2026-08-10 临时 API 故障应保持同一请求并自动恢复
+
+### 现象
+
+- 上游 API 在容量不足、结构化额度或 Token Budget 错误、`429/502/503/504`、建连失败和流式首写前断流时，会让 Codex 会话直接返回错误，需要人工再次发送任务。
+- 旧的 `guard_retry_attempts` 是 reasoning/Capacity/429 等策略的共享预算，不适合作为持续临时恢复的次数上限。
+
+### 根因
+
+- 旧网关只对少量策略错误或一次 fetch failure 处理重试，普通临时 `5xx`、结构化余额/用量错误和部分连接中断会直接回传。
+- 流式请求必须区分是否已向客户端首写；首写后重放完整请求会造成重复文本、工具调用或 SSE lifecycle，不能用“无限重试”掩盖该协议边界。
+- `200 + SSE response.failed` 的结构化额度事件虽然已被识别，但旧实现会中止当前 attempt 的 `AbortController`；后续等待把该内部中止误判为客户端断开，因而不会派发下一次上游请求。
+- 若结构化额度识别扫描整个 JSON 包，普通 `invalid_request` 错误附带的文档或回显文本中的 `token budget` 会被误判为额度故障，导致永久错误进入无限重试。
+- Capacity 识别也存在同类边界：结构化 `error` 对象之外的 `detail` / 回显字段提到 `model is at capacity` 时，不能覆盖真正的 `invalid_request` 语义。
+
+### 处理
+
+- 新增 `transient_retry`，默认开启：初始退避 `1000ms`，指数退避加抖动，单次等待硬限制 `600000ms`（10 分钟）。
+- 识别 `408/425/429/500/502/503/504/520-524`、容量不足、结构化 `insufficient_quota` / `billing_hard_limit` / 用量与 Token Budget 错误，以及常见 socket/network 错误。
+- 临时重试不消耗 `guard_retry_attempts`，持续到成功、客户端断开或 `latency_guard.total_timeout_ms` 到期；HTTP `Retry-After` 优先，但仍受 10 分钟上限限制。
+- 仅在客户端未收到任何响应时重放完整请求；流式已首写后只允许断连，不能重放或拼接第二轮。
+- 流式结构化失败只取消未转发的上游 reader，不中止用于等待重试的 attempt controller；HTTP `200` 只有明确 `{ "error": { ... } }` 的容量/额度包络才会重试，正常输出文本中提到 Token Budget 不会误触。
+- 额度与 Token Budget 的结构化判断只读取明确 `error.type`、`error.code` 和 `error.message`，不扫描其他 JSON 字段；普通参数错误会原样回传。
+- Capacity 判断在有结构化错误对象时只读取其 `type` / `code` / `message`；仅对无法解析为 JSON 的纯文本错误体扫描容量文案，避免辅助字段误触发。
+- Node server 的请求超时关闭，避免 10 分钟内的正常等待被 Node 默认超时截断。
+- Windows 安装与复用迁移会写入或规范化 `transient_retry`，上限始终钳制为 10 分钟。
+
+### 防回归
+
+- `node .\scripts\test-gateway-e2e.mjs` 覆盖 `502/503/504`、结构化 429/额度/Token Budget、HTTP `200` 结构化错误包络、正常文本不误重试、建连中断、流式 `response.failed` 与首写前断流的同一请求恢复。
+- E2E 额外覆盖 `400 invalid_request_error` 的其他字段提到 Token Budget 时只发起一次上游请求并原样返回，防止误吞永久请求错误。
+- E2E 同时覆盖结构化 `invalid_request_error` 的辅助字段提到 Capacity 时只发起一次请求，防止容量识别误吞永久请求错误。
+- `node .\scripts\test-install-restore.mjs` 覆盖 Windows 默认配置与旧配置迁移；`node .\scripts\test-launch-ui-unix.mjs` 覆盖 Unix 控制面不回归。
+- deadline 故障注入曾偶发在 lifecycle 跨线断言失败：首次 progress 的剩余时间因启动开销可计算为 `501ms`，而注入脚本只延迟到 `500ms`，使真实 timer 抢在预期的跨线 lifecycle 前中止。注入范围已覆盖到 `550ms`，保留“前序 chunk 必须在 deadline 前送达、后续 chunk 必须实际跨线”的断言。pending retry 仍保持“先发起真实 fetch、再归档旧样本”顺序，禁止回退为在派发前做同步归档。
+- 2026-08-10 再次发现 lifecycle 跨线断言的时间基准不一致：假上游的 `received_at_ms` 比 gateway 的真实 `upstream_fetch_started_at_ms` 晚数毫秒，导致实际已跨 gateway deadline 的 chunk 被误判为未跨线。回归断言改为使用样本记录的 `upstream_fetch_started_at_ms + 500ms`，同时验证假上游确实在该 deadline 前后各发出过 chunk；复验命令为 `node .\scripts\test-gateway-e2e.mjs`。
+- 纯文本 `400 insufficient_quota: token budget exceeded` 不含 JSON `error` 包络，原有严格结构化判断会将其直接回传。现仅当响应无法解析为 JSON 时扫描纯文本额度/用量/Token Budget 信号；可解析 JSON 仍只读取 `error.type/code/message`。E2E 覆盖该纯文本错误自动恢复，以及结构化 `invalid_request_error` 附带 Token Budget 文案不重试。
+- 临时建连中断或首写前 SSE 额度错误进入退避时，旧 attempt 的 `first_progress_timeout_ms` timer 曾继续 abort 当前 controller，导致等待尚未结束即返回 502。临时退避现在显式关闭旧 attempt 的首 progress 窗口，等待只受客户端断开和请求级 `total_timeout_ms` 限制；下一次真实 fetch 会创建新的首 progress 窗口。E2E 覆盖建连中断与 SSE 额度错误在 `120ms` 退避大于 `60ms` 首 progress 阈值时仍恢复成功。
+- 复审发现 `transient_retry` 初版只在异常分支检查开关，遗漏了 `endpoints` 边界：列表外路径在开启时会绕过原有两次 fetch fallback，进入持续重试。现在只对 `matchPath(config, pathname)` 命中的请求启用持续重试；列表外路径保持原有有限 fallback。E2E 以 `/v1/models` 连续两次建连失败为例，断言仍只发起两次上游请求并返回 `502`。
+- 复审又发现已解析的 JSON 标量（例如 JSON 字符串）不应回退扫描原始 body，否则 `400` 的普通说明文字提到 `model is at capacity` 时可能被误判为容量故障。容量文案兜底现仅用于无法解析的纯文本；E2E 覆盖 JSON 字符串提及 capacity 只发起一次请求并原样返回。
+- 后续红测发现容量辅助函数虽然已避开外层 `detail`，却仍将完整 `error` 对象序列化扫描，导致 `error.details` 提及 `model is at capacity` 的 `400 invalid_request_error` 被错误重放。结构化容量判断现与额度判断一致，只读取 `error.type`、`error.code`、`error.message`；E2E 先确认该场景失败，再断言修复后只发起一次上游请求并原样返回 `400`。
+
 ## 2026-07-06 Responses 流式安全续写不能透出截断轮输出
 
 ### 现象

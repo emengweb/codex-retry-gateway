@@ -203,6 +203,31 @@ function Normalize-LatencyGuard {
   }
 }
 
+function Normalize-TransientRetry {
+  param($Value)
+
+  $enabledValue = Get-OptionalPropertyValue -Object $Value -Name "enabled" -DefaultValue $true
+  $enabled = if ($enabledValue -is [bool]) { [bool]$enabledValue } else { $true }
+  $initialDelayMs = Normalize-LatencyGuardInteger `
+    -Value (Get-OptionalPropertyValue -Object $Value -Name "initial_delay_ms") `
+    -DefaultValue 1000
+  $maxDelayMs = Normalize-LatencyGuardInteger `
+    -Value (Get-OptionalPropertyValue -Object $Value -Name "max_delay_ms") `
+    -DefaultValue 600000
+
+  $initialDelayMs = [Math]::Min(600000, $initialDelayMs)
+  $maxDelayMs = [Math]::Min(600000, $maxDelayMs)
+  if ($initialDelayMs -gt $maxDelayMs) {
+    $initialDelayMs = $maxDelayMs
+  }
+
+  return [pscustomobject][ordered]@{
+    enabled = $enabled
+    initial_delay_ms = $initialDelayMs
+    max_delay_ms = $maxDelayMs
+  }
+}
+
 function ConvertTo-CanonicalJsonNode {
   param($Value)
 

@@ -1,9 +1,6 @@
-.DS_Store
-Thumbs.db
-*.log
 /.tasks/
 /.workskill/
 /.memory/
 /.gstack/
 /CUSTOM.md
-.codegraph/
+**/.codegraph/

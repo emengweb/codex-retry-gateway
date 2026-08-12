@@ -28,7 +28,9 @@ export const DEFAULT_CONTINUATION_MARKER_TEXT = "Continue thinking...";
 export const CONTINUATION_RECOVERY_STREAM_ACTION = "continuation_recovery";
 export const DEFAULT_STREAM_ACTION = CONTINUATION_RECOVERY_STREAM_ACTION;
 export const DEFAULT_GUARD_RETRY_ATTEMPTS = 5;
+const MAX_GUARD_RETRY_ATTEMPTS = 32;
 const MAX_TIMER_DELAY_MS = 2_147_483_647;
+const TRANSIENT_RETRY_MAX_DELAY_MS = 10 * 60 * 1000;
 const UPSTREAM_ERROR_ACTIONS = new Set([
   "pass_through",
   "return_502",
@@ -43,6 +45,11 @@ const DEFAULT_LATENCY_GUARD = {
   first_progress_timeout_ms: 0,
   first_progress_action: "return_502",
   total_timeout_ms: 0,
+};
+const DEFAULT_TRANSIENT_RETRY = {
+  enabled: true,
+  initial_delay_ms: 1000,
+  max_delay_ms: TRANSIENT_RETRY_MAX_DELAY_MS,
 };
 
 function escapeRegExp(value) {
@@ -115,6 +122,25 @@ function normalizeLatencyGuardConfig(value) {
     normalized.enabled = false;
   }
   return normalized;
+}
+
+function normalizeTransientRetryConfig(value) {
+  const source = value && typeof value === "object" && !Array.isArray(value) ? value : {};
+  const initialDelayMs = normalizeLatencyGuardInteger(
+    source.initial_delay_ms,
+    DEFAULT_TRANSIENT_RETRY.initial_delay_ms,
+  );
+  const maxDelayMs = normalizeLatencyGuardInteger(
+    source.max_delay_ms,
+    DEFAULT_TRANSIENT_RETRY.max_delay_ms,
+  );
+  const cappedInitialDelayMs = Math.min(TRANSIENT_RETRY_MAX_DELAY_MS, initialDelayMs);
+  const cappedMaxDelayMs = Math.min(TRANSIENT_RETRY_MAX_DELAY_MS, maxDelayMs);
+  return {
+    enabled: typeof source.enabled === "boolean" ? source.enabled : DEFAULT_TRANSIENT_RETRY.enabled,
+    initial_delay_ms: Math.min(cappedInitialDelayMs, cappedMaxDelayMs),
+    max_delay_ms: cappedMaxDelayMs,
+  };
 }
 
 export function parseOptions(argv, { booleanFlags = [] } = {}) {
@@ -423,7 +449,7 @@ function normalizeGuardRetryAttempts(value, fallback = DEFAULT_GUARD_RETRY_ATTEM
   }
   const text = `${value}`.trim();
   const parsed = Number.parseInt(text, 10);
-  return Number.isInteger(parsed) && parsed >= 0 && String(parsed) === text
+  return Number.isInteger(parsed) && parsed >= 0 && parsed <= MAX_GUARD_RETRY_ATTEMPTS && String(parsed) === text
     ? parsed
     : fallback;
 }
@@ -770,6 +796,7 @@ async function applyInstallForCurrentProvider({
       existingGatewayConfig?.http_429_action,
       DEFAULT_HTTP_429_ACTION,
     ),
+    transient_retry: normalizeTransientRetryConfig(existingGatewayConfig?.transient_retry),
     latency_guard: normalizeLatencyGuardConfig(existingGatewayConfig?.latency_guard),
     stream_action: legacyContinuationRuleMode
       ? CONTINUATION_RECOVERY_STREAM_ACTION
@@ -1002,6 +1029,9 @@ export async function launchUi({
       reusableGatewayConfig.http_429_action = normalizeUpstreamErrorAction(
         reusableGatewayConfig.http_429_action,
         DEFAULT_HTTP_429_ACTION,
+      );
+      reusableGatewayConfig.transient_retry = normalizeTransientRetryConfig(
+        reusableGatewayConfig.transient_retry,
       );
       reusableGatewayConfig.latency_guard = normalizeLatencyGuardConfig(
         reusableGatewayConfig.latency_guard,

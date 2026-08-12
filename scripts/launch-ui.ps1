@@ -182,6 +182,12 @@ if (-not $canReuseExistingInstall) {
     } else {
       $reusableGatewayConfig.http_429_action = $http429Action
     }
+    $transientRetry = Normalize-TransientRetry -Value (Get-OptionalPropertyValue -Object $reusableGatewayConfig -Name "transient_retry")
+    if ($null -eq $reusableGatewayConfig.PSObject.Properties["transient_retry"]) {
+      $reusableGatewayConfig | Add-Member -NotePropertyName "transient_retry" -NotePropertyValue $transientRetry
+    } else {
+      $reusableGatewayConfig.transient_retry = $transientRetry
+    }
     $latencyGuard = Normalize-LatencyGuard -Value (Get-OptionalPropertyValue -Object $reusableGatewayConfig -Name "latency_guard")
     if ($null -eq $reusableGatewayConfig.PSObject.Properties["latency_guard"]) {
       $reusableGatewayConfig | Add-Member -NotePropertyName "latency_guard" -NotePropertyValue $latencyGuard

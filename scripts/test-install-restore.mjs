@@ -234,6 +234,15 @@ async function run() {
       "Gateway config default http_429_action should pass through",
     );
     assert(
+      JSON.stringify(gatewayConfig.transient_retry) ===
+        JSON.stringify({
+          enabled: true,
+          initial_delay_ms: 1000,
+          max_delay_ms: 600000,
+        }),
+      "Gateway config default transient_retry should keep the request open with a 10 minute cap",
+    );
+    assert(
       JSON.stringify(gatewayConfig.latency_guard) ===
         JSON.stringify({
           enabled: false,
@@ -525,6 +534,15 @@ async function run() {
       "Install script did not default missing HTTP 429 action to pass through",
     );
     assert(
+      JSON.stringify(reinstalledGatewayConfig.transient_retry) ===
+        JSON.stringify({
+          enabled: true,
+          initial_delay_ms: 1000,
+          max_delay_ms: 600000,
+        }),
+      "Install script did not add default transient_retry settings",
+    );
+    assert(
       JSON.stringify(reinstalledGatewayConfig.latency_guard) ===
         JSON.stringify({
           enabled: false,
@@ -558,6 +576,11 @@ async function run() {
     gatewayConfig.retry_upstream_capacity_errors = false;
     delete gatewayConfig.capacity_error_action;
     delete gatewayConfig.http_429_action;
+    gatewayConfig.transient_retry = {
+      enabled: true,
+      initial_delay_ms: 700000,
+      max_delay_ms: 900000,
+    };
     delete gatewayConfig.latency_guard;
     gatewayConfig.request_body_limit_bytes = 10 * 1024 * 1024;
     await writeFile(
@@ -616,6 +639,15 @@ async function run() {
     assert(
       migratedGatewayConfig.http_429_action === "pass_through",
       "Launch UI reuse did not default missing HTTP 429 action to pass through",
+    );
+    assert(
+      JSON.stringify(migratedGatewayConfig.transient_retry) ===
+        JSON.stringify({
+          enabled: true,
+          initial_delay_ms: 600000,
+          max_delay_ms: 600000,
+        }),
+      "Launch UI reuse did not normalize transient_retry to the 10 minute maximum",
     );
     assert(
       JSON.stringify(migratedGatewayConfig.latency_guard) ===

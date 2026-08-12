@@ -1,0 +1,14 @@
+{
+  "schemaVersion": 1,
+  "name": "@workskill/browser-lifecycle-runtime",
+  "version": "1.0.1",
+  "files": [
+    "controlled-browser-process.mjs",
+    "controlled-browser-process.d.mts",
+    "controlled-browser-watchdog.mjs",
+    "controlled-playwright.mjs",
+    "controlled-playwright.d.mts"
+  ],
+  "contentDigest": "sha256:c83315c3c03db33d68b7ad9b5b4590261a493abaeca744c04cee7422fc3292c5",
+  "installedAt": "2026-08-10T15:31:24.213Z"
+}

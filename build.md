@@ -96,7 +96,7 @@ http://127.0.0.1:4610/__codex_retry_gateway/ui
 - 按统一 Profile 运行 reasoning 特征分析，展示 `analysis_value`、`conclusion`、字段覆盖率、候选摘要和基线对比
 - 导出 reasoning 行为统计 JSON / CSV
 - 启动历史导入预检并分析后台任务，先判断历史数据是否具备 reasoning 行为特征分析价值
-- 管理页热更新 `intercept_rule_mode` / `reasoning_match_mode` / `reasoning_equals` / `stream_action` / `endpoints` / `non_stream_status_code` / `guard_retry_attempts` / `capacity_error_action` / `http_429_action` / `latency_guard` / `log_match`
+- 管理页热更新 `intercept_rule_mode` / `reasoning_match_mode` / `reasoning_equals` / `stream_action` / `endpoints` / `non_stream_status_code` / `guard_retry_attempts` / `capacity_error_action` / `http_429_action` / `model_unavailable_error_action` / `http_502_503_error_action` / `other_http_4xx_error_action` / `other_http_5xx_error_action` / `error_message_fallback_action` / `transient_retry` / `latency_guard` / `log_match`
 - `continuation_marker_text` 支持配置/API 保存，当前管理页不单独提供输入框
 - 一键恢复 Codex 原设置并关闭 gateway
 
@@ -107,11 +107,13 @@ http://127.0.0.1:4610/__codex_retry_gateway/ui
 - `final_answer_only_high_xhigh` 是实验收窄规则，仅在 `reasoning.effort=high/xhigh` 下拦截 `final answer only + commentary not observed + no tool call + no reasoning item`，且 `reasoning_tokens=null/缺失` 或非 0 的响应结构；普通 `reasoning_tokens=0` 只观察落盘，不触发该实验规则。它可能漏掉仍影响正确性的 516 样本，不建议替代默认 516/1034/1552 主拦截。
 - `none` 不使用 reasoning 规则，直接透传正常流式响应并继续全量采集；Capacity、HTTP 429 与响应超时仍可独立叠加。
 - 三个规则模式三选一；`intercept_streaming` / `intercept_non_streaming` 只控制命中当前 reasoning 规则后是否真正拦截。
-- `stream_action=continuation_recovery` 是流式命中动作，不是拦截规则；仅在 `reasoning_tokens` 主规则命中时，对 `/responses` 与 `/v1/responses` 的流式响应尝试内部续写。`final_answer_only_high_xhigh` 实验规则不触发安全续写，只共用 `guard_retry_attempts` 做普通内部重试/最终拦截。续写请求会删除 `previous_response_id`，只显式 replay 原始 input 并追加 `phase=commentary` 标记，默认不自动请求 `reasoning.encrypted_content`，续写 replay 会过滤原始 input 中的 reasoning item / `encrypted_content`，安全模式下即使原请求显式 include 且本轮未命中，也会在所有下游响应体和本地请求摘要中剥离 `encrypted_content`，包括 Capacity/429 透传错误体；也不 replay 命中轮 encrypted reasoning item，不限定特定 token 公式。
-- `guard_retry_attempts` 默认 `5`，是单个客户端请求共享的内部追加尝试预算；reasoning 普通重试、Responses 续写恢复、Capacity、HTTP 429 与首 progress 超时重试都共用这里。
+- `stream_action=continuation_recovery` 是流式命中动作，不是拦截规则；仅在 `reasoning_tokens` 主规则命中时，对 `/responses` 与 `/v1/responses` 的流式响应尝试内部续写。`final_answer_only_high_xhigh` 实验规则不触发安全续写，只共用 `guard_retry_attempts` 做普通内部重试/最终拦截。续写请求会删除 `previous_response_id`，只显式 replay 原始 input 并追加 `phase=commentary` 标记，默认不自动请求 `reasoning.encrypted_content`，续写 replay 会过滤原始 input 中的 reasoning item / `encrypted_content`，安全模式下即使原请求显式 include 且本轮未命中，也会在普通下游响应体和本地请求摘要中剥离 `encrypted_content`，`request_kind=context_compaction` 除外；包括 Capacity/429 透传错误体；也不 replay 命中轮 encrypted reasoning item，不限定特定 token 公式。
+- `guard_retry_attempts` 默认 `5`，可取 `0..32`，是单个客户端请求共享的内部追加尝试预算；reasoning 普通重试、Responses 续写恢复、Capacity、HTTP 429 与首 progress 超时重试都共用这里。
 - `stream_action=continuation_recovery` 复用 `guard_retry_attempts` 控制最大安全续写次数；安全续写后的后续轮如果再次命中，会继续安全续写，耗尽后仍命中才返回拦截状态；各命中轮 lifecycle / reasoning item / tentative final answer / message / tool call / convenience `output_text` 不透给客户端，最终下游 SSE 以干净完成轮的 lifecycle 为准。
-- `remote_compaction_v2` 只是 beta feature 标记，不单独识别为压缩请求；只有显式 `context_compaction` 且 `reasoning_tokens=0` 的响应会豁免，`516/1034/1552` 等命中值仍按当前规则处理并受 `guard_retry_attempts` 控制。
-- `capacity_error_action` 默认 `retry_then_pass_through`，只精确匹配既有 Capacity 错误；`http_429_action` 默认 `pass_through`，处理剩余通用 HTTP 429 并遵守 `Retry-After`。二者支持 `pass_through`、`return_502`、`retry_then_pass_through`、`retry_then_502`。
+- `remote_compaction_v2` 只是 beta feature 标记，不单独识别为压缩请求；`x-codex-turn-metadata.request_kind=compaction`（以及兼容的显式 `context_compaction` 标记）会规范化为协议专用压缩请求，所有响应都豁免 reasoning 拦截、内部重试与续写恢复，并原样保留压缩 item 的 `encrypted_content`，确保上游压缩输出不被清空或替换；普通 turn 的 `516/1034/1552` 等命中值仍按当前规则处理并受 `guard_retry_attempts` 控制。
+- `capacity_error_action` 默认 `retry_then_pass_through`，只精确匹配既有 Capacity 错误；`http_429_action` 默认 `pass_through`，处理剩余通用 HTTP 429 并遵守 `Retry-After`。模型未配置/不可用、HTTP 502/503、其他 HTTP 4xx、其他 HTTP 5xx 与 `error.message` 兜底各有独立动作，默认均为 `retry_then_pass_through`。所有动作支持 `pass_through`、`return_502`、`retry_then_pass_through`、`retry_then_502`；默认开启的 `transient_retry` 对可恢复故障优先，关闭它后才使用这些动作的共享重试预算。
+- `transient_retry` 默认 `{ enabled: true, initial_delay_ms: 1000, max_delay_ms: 600000 }`：`429/502/503/504`、其它常见临时 4xx/5xx、结构化容量/额度/用量/Token Budget 错误、连接超时/重置，以及首写前流式断流会在同一客户端请求内自动重试。明确的 HTTP `200` `{ "error": { ... } }` 容量/额度包络同样可恢复，正常输出文本仅提到额度或 Token Budget 不会被误重试。退避采用指数增长加抖动，单次等待最多 10 分钟，单个客户端请求最多发起 `16` 次上游尝试，不消耗 `guard_retry_attempts`。
+- 自动重放的安全边界是“客户端尚未收到任何响应”：流式一旦已写 header 或正文，不再重放，以免重复文本、工具调用或 SSE envelope；此后异常只能断连。客户端主动断开或 gateway 进程退出后，不能脱离原 HTTP 会话继续重试。
 - `latency_guard` 默认关闭；首个有效输出超时可直接 502 或按共享预算重试后 502，总 deadline 跨 attempt 不重置。已经透传后不能改写 502，只能断连并落盘。
 - `endpoints` 同时限定 reasoning、Capacity、HTTP 429 与 latency guard；列表外路径必须全部旁路这些策略。
 - 两个 latency 阈值只接受 `0..2_147_483_647` 的整数；Retry-After 等待中命中总 deadline 必须复用当前 attempt 返回 timeout 502，不能静默结束或重复落盘。
@@ -168,7 +170,7 @@ reasoning 统计落盘说明：
 
 - gateway 是本机 Node.js 单进程异步代理，适合 Codex 本地路由和少量并发请求。
 - 日志在同一进程内通过单个 `WriteStream` 追加写入；当前模型下不会多进程抢写同一个日志文件。
-- 严格流式拦截会缓存 SSE，请求体也会先读入内存；高并发或大响应场景需要额外压测、日志轮转和内存上限治理。
+- 严格流式拦截会缓存 SSE，请求体也会先读入内存；严格模式累计 SSE 缓冲硬限制为 `8 MiB`，超过时在未首写前返回专用 `502`。高并发或大响应场景仍需要额外压测、日志轮转和内存上限治理。
 
 ## 本地验证
 
@@ -176,10 +178,14 @@ reasoning 统计落盘说明：
 
 ```powershell
 node .\scripts\test-gateway-e2e.mjs
+node .\scripts\test-content-encoding.mjs
+node .\scripts\test-memory-guard.mjs
 node .\scripts\test-install-restore.mjs
 node .\scripts\test-launch-ui.mjs
 node .\scripts\test-launch-ui-unix.mjs
 node --check .\gateway.mjs
+node --check .\scripts\test-content-encoding.mjs
+node --check .\scripts\test-memory-guard.mjs
 node --check .\scripts\admin-lib.mjs
 node --check .\scripts\test-gateway-e2e.mjs
 node --check .\scripts\test-install-restore.mjs

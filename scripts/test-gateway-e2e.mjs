@@ -317,7 +317,12 @@ function createTerminatedSseResponse(res, chunks, destroyDelayMs = 20, extraHead
   }, destroyDelayMs);
 }
 
-function buildResponsePayload(parsed, reasoning, retryAttempt = 0) {
+function buildResponsePayload(
+  parsed,
+  reasoning,
+  retryAttempt = 0,
+  responseAttemptNumber = 1,
+) {
   const payload = {
     id: parsed.test_response_id ?? "resp_test",
     model: parsed.test_response_model ?? parsed.model ?? "gpt-5.4",
@@ -330,6 +335,17 @@ function buildResponsePayload(parsed, reasoning, retryAttempt = 0) {
       },
     },
   };
+  const responseOutputText = Array.isArray(parsed.test_response_output_text_sequence)
+    ? parsed.test_response_output_text_sequence[
+        Math.min(
+          Math.max(0, responseAttemptNumber - 1),
+          parsed.test_response_output_text_sequence.length - 1,
+        )
+      ]
+    : parsed.test_response_output_text;
+  if (typeof responseOutputText === "string") {
+    payload.output_text = responseOutputText;
+  }
   if (parsed.test_omit_reasoning_tokens) {
     delete payload.usage.output_tokens_details.reasoning_tokens;
   }
@@ -626,6 +642,29 @@ function buildResponsesStreamChunks(parsed, reasoning, sequenceCount = 0) {
         })}\n\n`,
       );
     }
+  }
+
+  if (selectStreamFlag(parsed, "test_include_stream_compaction_item", sequenceCount)) {
+    const compactionItem = {
+      id: parsed.test_stream_compaction_id ?? "cmp_test_1",
+      type: "compaction",
+      encrypted_content:
+        parsed.test_stream_compaction_encrypted_content ?? "encrypted-compaction-test-content",
+    };
+    chunks.push(
+      `data: ${JSON.stringify({
+        type: "response.output_item.added",
+        output_index: 0,
+        item: { id: compactionItem.id, type: compactionItem.type },
+      })}\n\n`,
+    );
+    chunks.push(
+      `data: ${JSON.stringify({
+        type: "response.output_item.done",
+        output_index: 0,
+        item: compactionItem,
+      })}\n\n`,
+    );
   }
 
   if (parsed.test_include_stream_escaped_encrypted_content) {
@@ -961,6 +1000,38 @@ async function verifyRenderedUiEvidenceDetailsBehavior(uiHtml) {
   const inlineScriptMatch = uiHtml.match(/<script>([\s\S]*)<\/script>/);
   assert(inlineScriptMatch, "管理页缺少内联脚本");
 
+  const upstreamErrorPolicySelectors = [
+    ["modelUnavailableErrorActionSelect", "model_unavailable_error_action"],
+    ["http502503ErrorActionSelect", "http_502_503_error_action"],
+    ["otherHttp4xxErrorActionSelect", "other_http_4xx_error_action"],
+    ["otherHttp5xxErrorActionSelect", "other_http_5xx_error_action"],
+    ["errorMessageFallbackActionSelect", "error_message_fallback_action"],
+  ];
+  const upstreamErrorActions = [
+    "pass_through",
+    "return_502",
+    "retry_then_pass_through",
+    "retry_then_502",
+  ];
+  for (const [id, name] of upstreamErrorPolicySelectors) {
+    const selectorMatch = uiHtml.match(
+      new RegExp(`<select id="${id}" name="${name}">([\\s\\S]*?)<\\/select>`),
+    );
+    assert(selectorMatch, `管理页缺少 ${name} 下拉策略`);
+    for (const action of upstreamErrorActions) {
+      assert(
+        selectorMatch[1].includes(`value="${action}"`),
+        `${name} 下拉策略缺少 ${action} 动作`,
+      );
+    }
+  }
+  assert(
+    inlineScriptMatch[1].includes("prefers-color-scheme: dark") &&
+      inlineScriptMatch[1].includes("matchMedia") &&
+      inlineScriptMatch[1].includes("addEventListener('change'"),
+    "管理页主题未监听系统深浅色偏好变化",
+  );
+
   const ids = [
     "configForm",
     "reasoningInput",
@@ -982,6 +1053,14 @@ async function verifyRenderedUiEvidenceDetailsBehavior(uiHtml) {
     "guardRetryAttemptsInput",
     "capacityErrorActionSelect",
     "http429ActionSelect",
+    "modelUnavailableErrorActionSelect",
+    "http502503ErrorActionSelect",
+    "otherHttp4xxErrorActionSelect",
+    "otherHttp5xxErrorActionSelect",
+    "errorMessageFallbackActionSelect",
+    "transientRetryEnabledInput",
+    "transientRetryInitialDelayMsInput",
+    "transientRetryMaxDelayMsInput",
     "latencyGuardEnabledInput",
     "firstProgressTimeoutMsInput",
     "firstProgressActionSelect",
@@ -1093,6 +1172,9 @@ async function verifyRenderedUiEvidenceDetailsBehavior(uiHtml) {
     "statsFootnote",
     "logsMeta",
     "logsOutput",
+    "themeToggleButton",
+    "themeToggleIcon",
+    "themeToggleText",
   ];
   const elements = Object.fromEntries(
     ids.map((id) => [
@@ -1104,6 +1186,14 @@ async function verifyRenderedUiEvidenceDetailsBehavior(uiHtml) {
   elements.guardRetryAttemptsInput.value = "3";
   elements.capacityErrorActionSelect.value = "retry_then_502";
   elements.http429ActionSelect.value = "return_502";
+  elements.modelUnavailableErrorActionSelect.value = "return_502";
+  elements.http502503ErrorActionSelect.value = "retry_then_502";
+  elements.otherHttp4xxErrorActionSelect.value = "pass_through";
+  elements.otherHttp5xxErrorActionSelect.value = "retry_then_pass_through";
+  elements.errorMessageFallbackActionSelect.value = "return_502";
+  elements.transientRetryEnabledInput.checked = true;
+  elements.transientRetryInitialDelayMsInput.value = "1000";
+  elements.transientRetryMaxDelayMsInput.value = "600000";
   elements.latencyGuardEnabledInput.checked = true;
   elements.firstProgressTimeoutMsInput.value = "1500";
   elements.firstProgressActionSelect.value = "retry_then_502";
@@ -1132,6 +1222,16 @@ async function verifyRenderedUiEvidenceDetailsBehavior(uiHtml) {
       guard_retry_attempts: 3,
       capacity_error_action: "retry_then_pass_through",
       http_429_action: "pass_through",
+      model_unavailable_error_action: "retry_then_pass_through",
+      http_502_503_error_action: "retry_then_pass_through",
+      other_http_4xx_error_action: "retry_then_pass_through",
+      other_http_5xx_error_action: "retry_then_pass_through",
+      error_message_fallback_action: "retry_then_pass_through",
+      transient_retry: {
+        enabled: true,
+        initial_delay_ms: 1000,
+        max_delay_ms: 600000,
+      },
       latency_guard: {
         enabled: false,
         first_progress_timeout_ms: 0,
@@ -1893,11 +1993,34 @@ async function verifyRenderedUiEvidenceDetailsBehavior(uiHtml) {
       },
     },
     document: {
+      documentElement: { dataset: {} },
       getElementById(id) {
         return elements[id] || null;
       },
     },
     fetch: fetchMock,
+  };
+  const themeStorage = new Map([["codexRetryGatewayTheme", "system"]]);
+  let systemThemeChangeListener = null;
+  const systemThemeMediaQuery = {
+    matches: true,
+    addEventListener(eventName, listener) {
+      if (eventName === "change") {
+        systemThemeChangeListener = listener;
+      }
+    },
+  };
+  sandbox.window.localStorage = {
+    getItem(key) {
+      return themeStorage.get(key) || null;
+    },
+    setItem(key, value) {
+      themeStorage.set(key, value);
+    },
+  };
+  sandbox.window.matchMedia = (query) => {
+    assert(query === "(prefers-color-scheme: dark)", "主题系统偏好查询不正确");
+    return systemThemeMediaQuery;
   };
   sandbox.window.fetch = fetchMock;
   sandbox.window.document = sandbox.document;
@@ -1907,6 +2030,37 @@ async function verifyRenderedUiEvidenceDetailsBehavior(uiHtml) {
   new vm.Script(inlineScriptMatch[1]).runInContext(sandbox);
   await new Promise((resolve) => setImmediate(resolve));
   await new Promise((resolve) => setImmediate(resolve));
+
+  assert(
+    sandbox.document.documentElement.dataset.theme === "dark" &&
+      elements.themeToggleText.textContent === "跟随系统" &&
+      typeof systemThemeChangeListener === "function",
+    "管理页未按 system 偏好解析深色主题或注册变化监听",
+  );
+  systemThemeMediaQuery.matches = false;
+  systemThemeChangeListener({ matches: false });
+  assert(
+    sandbox.document.documentElement.dataset.theme === "light",
+    "跟随系统时系统切换到浅色未立即更新页面主题",
+  );
+  elements.themeToggleButton.emit("click", {});
+  assert(
+    themeStorage.get("codexRetryGatewayTheme") === "light" &&
+      sandbox.document.documentElement.dataset.theme === "light",
+    "主题按钮在 system 后未切换到浅色偏好",
+  );
+  elements.themeToggleButton.emit("click", {});
+  assert(
+    themeStorage.get("codexRetryGatewayTheme") === "dark" &&
+      sandbox.document.documentElement.dataset.theme === "dark",
+    "主题按钮未从浅色切换到深色偏好",
+  );
+  elements.themeToggleButton.emit("click", {});
+  assert(
+    themeStorage.get("codexRetryGatewayTheme") === "system" &&
+      sandbox.document.documentElement.dataset.theme === "light",
+    "主题按钮未从深色切换回跟随系统偏好",
+  );
 
   assert(
     typeof sandbox.renderSuspiciousSamples === "function",
@@ -2009,6 +2163,18 @@ async function verifyRenderedUiEvidenceDetailsBehavior(uiHtml) {
   assert(
     elements.http429ActionSelect.value === "pass_through",
     "管理页未回填 HTTP 429 动作",
+  );
+  for (const [id, name] of upstreamErrorPolicySelectors) {
+    assert(
+      elements[id].value === "retry_then_pass_through",
+      `管理页未回填 ${name} 动作`,
+    );
+  }
+  assert(
+    elements.transientRetryEnabledInput.checked === true &&
+      elements.transientRetryInitialDelayMsInput.value === "1000" &&
+      elements.transientRetryMaxDelayMsInput.value === "600000",
+    "管理页未回填临时故障自动恢复配置",
   );
   assert(
     elements.latencyGuardEnabledInput.checked === false &&
@@ -2603,6 +2769,14 @@ async function verifyRenderedUiEvidenceDetailsBehavior(uiHtml) {
   elements.interceptRuleModeSelect.value = "none";
   elements.capacityErrorActionSelect.value = "retry_then_502";
   elements.http429ActionSelect.value = "return_502";
+  elements.modelUnavailableErrorActionSelect.value = "return_502";
+  elements.http502503ErrorActionSelect.value = "retry_then_502";
+  elements.otherHttp4xxErrorActionSelect.value = "pass_through";
+  elements.otherHttp5xxErrorActionSelect.value = "retry_then_pass_through";
+  elements.errorMessageFallbackActionSelect.value = "return_502";
+  elements.transientRetryEnabledInput.checked = true;
+  elements.transientRetryInitialDelayMsInput.value = "250";
+  elements.transientRetryMaxDelayMsInput.value = "600000";
   elements.latencyGuardEnabledInput.checked = true;
   elements.firstProgressTimeoutMsInput.value = "1500";
   elements.firstProgressActionSelect.value = "retry_then_502";
@@ -2648,6 +2822,20 @@ async function verifyRenderedUiEvidenceDetailsBehavior(uiHtml) {
   assert(
     savedPayload.http_429_action === "return_502",
     "saveConfig 未提交 HTTP 429 动作",
+  );
+  assert(
+    savedPayload.model_unavailable_error_action === "return_502" &&
+      savedPayload.http_502_503_error_action === "retry_then_502" &&
+      savedPayload.other_http_4xx_error_action === "pass_through" &&
+      savedPayload.other_http_5xx_error_action === "retry_then_pass_through" &&
+      savedPayload.error_message_fallback_action === "return_502",
+    "saveConfig 未提交完整新增上游错误策略",
+  );
+  assert(
+    savedPayload.transient_retry?.enabled === true &&
+      savedPayload.transient_retry?.initial_delay_ms === 250 &&
+      savedPayload.transient_retry?.max_delay_ms === 600000,
+    "saveConfig 未提交完整临时故障自动恢复配置",
   );
   assert(
     savedPayload.latency_guard?.enabled === true &&
@@ -3097,13 +3285,17 @@ async function createHistoricalImportFixtures(tempRoot) {
 
 function startFakeUpstream(port) {
   const failBeforeResponseCounts = new Map();
+  const modelsRequestCounts = new Map();
   const responseAttemptCounts = new Map();
   const reasoningSequenceCounts = new Map();
   const capacityErrorCounts = new Map();
   const http429Counts = new Map();
+  const transientErrorCounts = new Map();
+  const streamTransientErrorCounts = new Map();
   const identityProbeCounts = new Map();
   const probeRequests = [];
   const responseRequests = [];
+  const modelRequests = [];
   const chatCompletionRequests = [];
   const server = http.createServer((req, res) => {
     const responsePaths = new Set(["/responses", "/v1/responses"]);
@@ -3113,7 +3305,27 @@ function startFakeUpstream(port) {
     ]);
 
     if (req.method === "GET" && req.url.startsWith("/v1/models")) {
+      const modelsUrl = new URL(req.url, "http://127.0.0.1");
+      const modelsRequestKey = modelsUrl.searchParams.get("test_sequence_key") || req.url;
+      const modelsRequestCount = (modelsRequestCounts.get(modelsRequestKey) || 0) + 1;
+      modelsRequestCounts.set(modelsRequestKey, modelsRequestCount);
+      modelRequests.push({
+        path: req.url,
+        attempt_number: modelsRequestCount,
+        sequence_key: modelsRequestKey,
+      });
       if (req.url.includes("test_fail_before_response=1")) {
+        res.socket?.destroy();
+        return;
+      }
+      const failBeforeResponseAttempts = Number.parseInt(
+        modelsUrl.searchParams.get("test_fail_before_response_attempts") || "0",
+        10,
+      );
+      if (
+        Number.isInteger(failBeforeResponseAttempts) &&
+        modelsRequestCount <= failBeforeResponseAttempts
+      ) {
         res.socket?.destroy();
         return;
       }
@@ -3128,7 +3340,6 @@ function startFakeUpstream(port) {
           { "x-upstream-test": "models-ok" },
         );
       };
-      const modelsUrl = new URL(req.url, "http://127.0.0.1");
       const delayMs = Number.parseInt(modelsUrl.searchParams.get("test_delay_ms") || "0", 10);
       if (Number.isInteger(delayMs) && delayMs > 0) {
         setTimeout(sendModelsResponse, delayMs);
@@ -3211,6 +3422,13 @@ function startFakeUpstream(port) {
           }
         }
         if (parsed.test_fail_before_response_always) {
+          res.socket?.destroy();
+          return;
+        }
+        if (
+          Number.isInteger(parsed.test_fail_before_response_attempts) &&
+          responseAttemptNumber <= parsed.test_fail_before_response_attempts
+        ) {
           res.socket?.destroy();
           return;
         }
@@ -3568,6 +3786,36 @@ function startFakeUpstream(port) {
             return;
           }
         }
+        if (parsed.test_transient_error_attempts > 0) {
+          const transientErrorKey = `${req.url}:transient-error:${parsed.test_sequence_key || "default"}`;
+          const transientErrorCount = (transientErrorCounts.get(transientErrorKey) || 0) + 1;
+          transientErrorCounts.set(transientErrorKey, transientErrorCount);
+          if (transientErrorCount <= parsed.test_transient_error_attempts) {
+            if (parsed.test_transient_error_content_type) {
+              createTextResponse(
+                res,
+                parsed.test_transient_error_status ?? 503,
+                parsed.test_transient_error_raw_body ?? "Upstream service temporarily unavailable",
+                parsed.test_transient_error_content_type,
+                { "x-upstream-test": "responses-transient-error" },
+              );
+              return;
+            }
+            createJsonResponse(
+              res,
+              parsed.test_transient_error_status ?? 503,
+              parsed.test_transient_error_payload ?? {
+                error: {
+                  type: "upstream_error",
+                  code: "temporarily_unavailable",
+                  message: "Upstream service temporarily unavailable",
+                },
+              },
+              { "x-upstream-test": "responses-transient-error" },
+            );
+            return;
+          }
+        }
         if (parsed.test_error_payload) {
           createJsonResponse(
             res,
@@ -3586,11 +3834,22 @@ function startFakeUpstream(port) {
           createJsonResponse(
             res,
             200,
-            buildResponsePayload(parsed, reasoning, retryAttempt),
+            buildResponsePayload(
+              parsed,
+              reasoning,
+              retryAttempt,
+              responseAttemptNumber,
+            ),
             { "x-upstream-test": `responses-${reasoning}` },
           );
         };
-        if (parsed.test_force_terminate_before_progress) {
+        if (
+          parsed.test_force_terminate_before_progress ||
+          (
+            Number.isInteger(parsed.test_force_terminate_before_progress_attempts) &&
+            responseAttemptNumber <= parsed.test_force_terminate_before_progress_attempts
+          )
+        ) {
           createTerminatedSseResponse(res, [
             'data: {"type":"response.created","response":{"id":"resp_terminated","model":"gpt-5.4"}}\n\n',
           ], parsed.test_terminate_delay_ms ?? 20, parsed.test_termination_header_copy_stall
@@ -3605,6 +3864,50 @@ function startFakeUpstream(port) {
           return;
         }
         if (parsed.stream) {
+          if (parsed.test_stream_transient_error_attempts > 0) {
+            const streamTransientErrorKey =
+              `${req.url}:stream-transient-error:${parsed.test_sequence_key || "default"}`;
+            const streamTransientErrorCount =
+              (streamTransientErrorCounts.get(streamTransientErrorKey) || 0) + 1;
+            streamTransientErrorCounts.set(streamTransientErrorKey, streamTransientErrorCount);
+            if (streamTransientErrorCount <= parsed.test_stream_transient_error_attempts) {
+              res.writeHead(200, {
+                "content-type": "text/event-stream; charset=utf-8",
+                "x-upstream-test": "responses-stream-transient-error",
+              });
+              res.end(
+                `data: ${JSON.stringify({
+                  type: "response.failed",
+                  response: {
+                    id: "resp_stream_transient_error",
+                    error: parsed.test_stream_transient_error_payload ?? {
+                      type: "insufficient_quota",
+                      code: "billing_hard_limit_reached",
+                      message: "You exceeded your current quota and token budget.",
+                    },
+                  },
+                })}\n\ndata: [DONE]\n\n`,
+              );
+              return;
+            }
+          }
+          if (parsed.test_stream_completed_error_payload) {
+            res.writeHead(200, {
+              "content-type": "text/event-stream; charset=utf-8",
+              "x-upstream-test": "responses-stream-completed-error-payload",
+            });
+            res.end(
+              `data: ${JSON.stringify({
+                type: "response.completed",
+                response: {
+                  id: "resp_stream_completed",
+                  model: "gpt-5.4",
+                  error: parsed.test_stream_completed_error_payload,
+                },
+              })}\n\ndata: [DONE]\n\n`,
+            );
+            return;
+          }
           if (parsed.test_force_malformed_json_for_stream) {
             res.writeHead(200, {
               "content-type": "application/json; charset=utf-8",
@@ -3824,6 +4127,7 @@ function startFakeUpstream(port) {
     server.once("error", reject);
     server.listen(port, "127.0.0.1", () => {
       server.probeRequests = probeRequests;
+      server.modelRequests = modelRequests;
       server.responseRequests = responseRequests;
       server.chatCompletionRequests = chatCompletionRequests;
       resolve(server);
@@ -4377,6 +4681,11 @@ async function run() {
     reasoning_equals: [516],
     non_stream_status_code: 502,
     stream_action: "strict_502",
+    transient_retry: {
+      enabled: false,
+      initial_delay_ms: 0,
+      max_delay_ms: 0,
+    },
     log_match: true,
     health_path: "/__codex_retry_gateway/health",
   };
@@ -4434,6 +4743,44 @@ async function run() {
     assert(
       statusBeforeUiRefresh.config?.guard_retry_attempts === 5,
       "guard_retry_attempts 默认应为 5",
+    );
+    for (const field of [
+      "model_unavailable_error_action",
+      "http_502_503_error_action",
+      "other_http_4xx_error_action",
+      "other_http_5xx_error_action",
+      "error_message_fallback_action",
+    ]) {
+      assert(
+        statusBeforeUiRefresh.config?.[field] === "retry_then_pass_through",
+        `${field} 默认应为 retry_then_pass_through`,
+      );
+    }
+    const isolateNewUpstreamPoliciesResponse = await fetch(
+      `http://127.0.0.1:${gatewayPort}/__codex_retry_gateway/api/config`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          model_unavailable_error_action: "pass_through",
+          http_502_503_error_action: "pass_through",
+          other_http_4xx_error_action: "pass_through",
+          other_http_5xx_error_action: "pass_through",
+          error_message_fallback_action: "pass_through",
+        }),
+      },
+    );
+    const isolatedNewUpstreamPolicies = await isolateNewUpstreamPoliciesResponse.json();
+    assert(
+      isolateNewUpstreamPoliciesResponse.status === 200 &&
+        [
+          "model_unavailable_error_action",
+          "http_502_503_error_action",
+          "other_http_4xx_error_action",
+          "other_http_5xx_error_action",
+          "error_message_fallback_action",
+        ].every((field) => isolatedNewUpstreamPolicies.config?.[field] === "pass_through"),
+      "新增上游错误策略保存后应立即在状态接口回读",
     );
     assert(
       statusBeforeUiRefresh.config?.retry_upstream_capacity_errors === true,
@@ -4613,11 +4960,14 @@ async function run() {
     assert(
       uiHtml.includes('id="capacityErrorActionSelect"') &&
         uiHtml.includes('id="http429ActionSelect"') &&
+        uiHtml.includes('id="transientRetryEnabledInput"') &&
+        uiHtml.includes('id="transientRetryInitialDelayMsInput"') &&
+        uiHtml.includes('id="transientRetryMaxDelayMsInput"') &&
         uiHtml.includes('id="latencyGuardEnabledInput"') &&
         uiHtml.includes('id="firstProgressTimeoutMsInput"') &&
         uiHtml.includes('id="firstProgressActionSelect"') &&
         uiHtml.includes('id="totalTimeoutMsInput"'),
-      "管理页缺少 Capacity、HTTP 429 或响应超时策略控件",
+      "管理页缺少 Capacity、HTTP 429、临时故障自动恢复或响应超时策略控件",
     );
     assert(
       (uiHtml.match(/class="field compact-config-field"/g) || []).length >= 3 &&
@@ -4714,12 +5064,53 @@ async function run() {
         statusBeforeUiRefresh.metrics.total_proxy_request_count,
       "管理页刷新相关请求不应增加代理请求总数",
     );
+    const enableTransientRetryForBypassBoundary = await fetch(
+      `http://127.0.0.1:${gatewayPort}/__codex_retry_gateway/api/config`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          transient_retry: {
+            enabled: true,
+            initial_delay_ms: 0,
+            max_delay_ms: 0,
+          },
+        }),
+      },
+    );
+    assert(
+      enableTransientRetryForBypassBoundary.status === 200,
+      "旁路边界测试前启用临时重试失败",
+    );
+    const brokenBypassKey = "bypass-fetch-fallback-must-remain-bounded";
     const brokenBypassResponse = await fetch(
-      `http://127.0.0.1:${gatewayPort}/v1/models?test_fail_before_response=1`,
+      `http://127.0.0.1:${gatewayPort}/v1/models?test_sequence_key=${encodeURIComponent(brokenBypassKey)}&test_fail_before_response_attempts=2`,
     );
     assert(
       brokenBypassResponse.status === 502,
       `异常旁路请求应返回 502，实际为 ${brokenBypassResponse.status}`,
+    );
+    assert(
+      upstream.modelRequests.filter((entry) => entry.sequence_key === brokenBypassKey).length === 2,
+      "列表外路径只应保留原有两次 fetch fallback，不应进入临时故障持续重试",
+    );
+    const disableTransientRetryAfterBypassBoundary = await fetch(
+      `http://127.0.0.1:${gatewayPort}/__codex_retry_gateway/api/config`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          transient_retry: {
+            enabled: false,
+            initial_delay_ms: 0,
+            max_delay_ms: 0,
+          },
+        }),
+      },
+    );
+    assert(
+      disableTransientRetryAfterBypassBoundary.status === 200,
+      "旁路边界测试后恢复临时重试配置失败",
     );
     const statusAfterBrokenBypass = await fetch(
       `http://127.0.0.1:${gatewayPort}/__codex_retry_gateway/api/status`,
@@ -5992,8 +6383,8 @@ async function run() {
       },
     );
     assert(
-      compactionFinalOnlyNullResponse.status === 502,
-      `context_compaction 仅 reasoning_tokens=0 可豁免，null 应按 final only 规则拦截: ${compactionFinalOnlyNullResponse.status}`,
+      compactionFinalOnlyNullResponse.status === 200,
+      `context_compaction reasoning_tokens=null 也必须原样透传: ${compactionFinalOnlyNullResponse.status}`,
     );
     const compactionFinalOnlyLowResponse = await fetch(
       `http://127.0.0.1:${gatewayPort}/responses`,
@@ -6017,7 +6408,8 @@ async function run() {
       compactionFinalOnlyLowResponse.status === 200,
       `remote_compaction_v2 reasoning_tokens=18 不应被 final only 模式拦截: ${compactionFinalOnlyLowResponse.status}`,
     );
-    const compactionFinalOnlyXhighPositiveResponse = await fetch(
+    const compactionReasoningRuleBypassKey = "context-compaction-516-bypass";
+    const compactionReasoningRuleBypassResponse = await fetch(
       `http://127.0.0.1:${gatewayPort}/responses`,
       {
         method: "POST",
@@ -6030,14 +6422,53 @@ async function run() {
           model: "gpt-5.5",
           reasoning: { effort: "xhigh" },
           input: [{ role: "user", content: "compact the current conversation" }],
-          test_reasoning_tokens: 85,
+          test_reasoning_tokens: 516,
           test_include_final_answer_only: true,
+          test_sequence_key: compactionReasoningRuleBypassKey,
         }),
       },
     );
     assert(
-      compactionFinalOnlyXhighPositiveResponse.status === 502,
-      `context_compaction 仅 reasoning_tokens=0 可豁免，xhigh 非 0 应按 final only 规则拦截: ${compactionFinalOnlyXhighPositiveResponse.status}`,
+      compactionReasoningRuleBypassResponse.status === 200,
+      `context_compaction reasoning_tokens=516 必须原样透传唯一压缩输出: ${compactionReasoningRuleBypassResponse.status}`,
+    );
+    assert(
+      upstream.responseRequests.filter(
+        (entry) => entry.body?.test_sequence_key === compactionReasoningRuleBypassKey,
+      ).length === 1,
+      "context_compaction reasoning_tokens=516 不应触发内部重试或续写",
+    );
+    const metadataCompactionKey = "metadata-compaction-516-bypass";
+    const metadataCompactionResponse = await fetch(
+      `http://127.0.0.1:${gatewayPort}/responses`,
+      {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "x-codex-beta-features": "remote_compaction_v2",
+          "x-codex-turn-metadata": JSON.stringify({
+            request_kind: "compaction",
+          }),
+        },
+        body: JSON.stringify({
+          model: "gpt-5.5",
+          reasoning: { effort: "xhigh" },
+          input: [{ role: "user", content: "compact the current conversation" }],
+          test_reasoning_tokens: 516,
+          test_include_final_answer_only: true,
+          test_sequence_key: metadataCompactionKey,
+        }),
+      },
+    );
+    assert(
+      metadataCompactionResponse.status === 200,
+      `x-codex-turn-metadata request_kind=compaction 必须透传唯一压缩输出: ${metadataCompactionResponse.status}`,
+    );
+    assert(
+      upstream.responseRequests.filter(
+        (entry) => entry.body?.test_sequence_key === metadataCompactionKey,
+      ).length === 1,
+      "request_kind=compaction 不应触发内部重试或本地拦截",
     );
     const compactionAnalytics = await fetch(
       `http://127.0.0.1:${gatewayPort}/__codex_retry_gateway/api/analytics/reasoning`,
@@ -6052,17 +6483,23 @@ async function run() {
     const compactionZeroSample = compactionSamples.find((sample) => sample.reasoning_tokens === 0);
     const compactionNullSample = compactionSamples.find((sample) => sample.reasoning_tokens === null);
     const compactionLowSample = compactionSamples.find((sample) => sample.reasoning_tokens === 18);
-    const compactionXhighPositiveSample = compactionSamples.find(
+    const compactionReasoningRuleBypassSample = compactionSamples.find(
       (sample) =>
-        sample.reasoning_tokens === 85 &&
-        sample.request_reasoning_effort === "xhigh",
+        sample.reasoning_tokens === 516 &&
+        `${sample.request_payload_excerpt || ""}`.includes(compactionReasoningRuleBypassKey),
+    );
+    const metadataCompactionSample = compactionSamples.find(
+      (sample) =>
+        sample.reasoning_tokens === 516 &&
+        `${sample.request_payload_excerpt || ""}`.includes(metadataCompactionKey),
     );
     assert(
       compactionZeroSample &&
         compactionNullSample &&
         compactionLowSample &&
-        compactionXhighPositiveSample,
-      `context_compaction 样本应覆盖 reasoning_tokens=0/null/非 0 high-xhigh: ${JSON.stringify(compactionSamples)}`,
+        compactionReasoningRuleBypassSample &&
+        metadataCompactionSample,
+      `context_compaction 样本应覆盖 reasoning_tokens=0/null/18/516: ${JSON.stringify(compactionSamples)}`,
     );
     assert(
       compactionZeroSample.final_action === "passed" &&
@@ -6073,22 +6510,84 @@ async function run() {
       `只有 reasoning_tokens=0 的 context_compaction 样本应标记豁免: ${JSON.stringify(compactionZeroSample)}`,
     );
     assert(
-      compactionNullSample.matched_current_rule === true &&
-        compactionNullSample.blocked_by_gateway === true &&
-        compactionNullSample.intercept_exempt_reason !== "context_compaction",
-      `reasoning_tokens=null 的 context_compaction 样本不应豁免，应按 final only 规则拦截: ${JSON.stringify(compactionNullSample)}`,
+      compactionNullSample.final_action === "passed" &&
+        compactionNullSample.matched_current_rule === false &&
+        compactionNullSample.intercept_exempt_reason === "context_compaction",
+      `reasoning_tokens=null 的 context_compaction 样本也必须豁免: ${JSON.stringify(compactionNullSample)}`,
     );
     assert(
       compactionLowSample.final_action === "passed" &&
         compactionLowSample.matched_current_rule === false &&
-        compactionLowSample.intercept_exempt_reason !== "context_compaction",
-      `reasoning_tokens=18 的 context_compaction 样本不应标记压缩豁免: ${JSON.stringify(compactionLowSample)}`,
+        compactionLowSample.intercept_exempt_reason === "context_compaction",
+      `reasoning_tokens=18 的 context_compaction 样本必须标记压缩豁免: ${JSON.stringify(compactionLowSample)}`,
     );
     assert(
-      compactionXhighPositiveSample.matched_current_rule === true &&
-        compactionXhighPositiveSample.blocked_by_gateway === true &&
-        compactionXhighPositiveSample.intercept_exempt_reason !== "context_compaction",
-      `xhigh 非 0 的 context_compaction 样本不应压缩豁免，应按 final only 规则拦截: ${JSON.stringify(compactionXhighPositiveSample)}`,
+      compactionReasoningRuleBypassSample.final_action === "passed" &&
+        compactionReasoningRuleBypassSample.matched_current_rule === false &&
+        compactionReasoningRuleBypassSample.blocked_by_gateway === false &&
+        compactionReasoningRuleBypassSample.intercept_exempt_reason === "context_compaction",
+      `reasoning_tokens=516 的 context_compaction 样本必须完整豁免: ${JSON.stringify(compactionReasoningRuleBypassSample)}`,
+    );
+    assert(
+      metadataCompactionSample.final_action === "passed" &&
+        metadataCompactionSample.client_http_status === 200 &&
+        metadataCompactionSample.matched_current_rule === false &&
+        metadataCompactionSample.blocked_by_gateway === false &&
+        metadataCompactionSample.intercept_exempt_reason === "context_compaction",
+      `request_kind=compaction 样本必须标记压缩豁免: ${JSON.stringify(metadataCompactionSample)}`,
+    );
+
+    const compactionEncryptedKey = "metadata-compaction-encrypted-preservation";
+    const compactionEncryptedSecret = "compaction-encrypted-content-must-survive";
+    const compactionEncryptedConfigResponse = await fetch(
+      `http://127.0.0.1:${gatewayPort}/__codex_retry_gateway/api/config`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ stream_action: "continuation_recovery" }),
+      },
+    );
+    assert(
+      compactionEncryptedConfigResponse.status === 200,
+      `压缩协议清洗回归测试切换 continuation_recovery 失败: ${compactionEncryptedConfigResponse.status}`,
+    );
+    const compactionEncryptedResponse = await readSseUntilClose(
+      `http://127.0.0.1:${gatewayPort}/responses`,
+      {
+        model: "gpt-5.5",
+        reasoning: { effort: "xhigh" },
+        stream: true,
+        input: [{ role: "user", content: "compact the current conversation" }],
+        test_sequence_key: compactionEncryptedKey,
+        test_reasoning_sequence: [0],
+        test_stream_text: "",
+        test_include_stream_compaction_item: true,
+        test_stream_compaction_encrypted_content: compactionEncryptedSecret,
+      },
+      {
+        headers: {
+          "x-codex-beta-features": "remote_compaction_v2",
+          "x-codex-turn-metadata": JSON.stringify({ request_kind: "compaction" }),
+        },
+      },
+    );
+    assert(
+      compactionEncryptedResponse.status === 200 &&
+        compactionEncryptedResponse.text.includes("encrypted_content") &&
+        compactionEncryptedResponse.text.includes(compactionEncryptedSecret),
+      `request_kind=compaction 必须原样保留唯一 compaction item: ${compactionEncryptedResponse.text}`,
+    );
+    const compactionEncryptedRestoreResponse = await fetch(
+      `http://127.0.0.1:${gatewayPort}/__codex_retry_gateway/api/config`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ stream_action: "strict_502" }),
+      },
+    );
+    assert(
+      compactionEncryptedRestoreResponse.status === 200,
+      `压缩协议清洗回归测试恢复 strict_502 失败: ${compactionEncryptedRestoreResponse.status}`,
     );
     const compactionExemptPattern = (compactionAnalytics.candidate_patterns || []).find(
       (entry) =>
@@ -6096,8 +6595,8 @@ async function run() {
         "reasoning=18|final_answer_only|commentary_not_observed",
     );
     assert(
-      compactionExemptPattern?.status === "observe_only",
-      `非 0 的 context_compaction 候选组合不应标记 context_compaction_exempt: ${JSON.stringify(compactionExemptPattern)}`,
+      compactionExemptPattern?.status === "context_compaction_exempt",
+      `context_compaction 候选组合应标记为压缩豁免: ${JSON.stringify(compactionExemptPattern)}`,
     );
     const finalOnlyHighStreamZeroResponse = await fetch(
       `http://127.0.0.1:${gatewayPort}/responses`,
@@ -6684,6 +7183,158 @@ async function run() {
         },
       });
     }
+
+    const newUpstreamPoliciesConfigResponse = await fetch(
+      `http://127.0.0.1:${gatewayPort}/__codex_retry_gateway/api/config`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          intercept_rule_mode: "none",
+          guard_retry_attempts: 1,
+          transient_retry: {
+            enabled: false,
+            initial_delay_ms: 0,
+            max_delay_ms: 0,
+          },
+          http_429_action: "pass_through",
+          model_unavailable_error_action: "retry_then_pass_through",
+          http_502_503_error_action: "retry_then_pass_through",
+          other_http_4xx_error_action: "retry_then_pass_through",
+          other_http_5xx_error_action: "retry_then_pass_through",
+          error_message_fallback_action: "retry_then_pass_through",
+        }),
+      },
+    );
+    assert(
+      newUpstreamPoliciesConfigResponse.status === 200,
+      `新增上游错误策略配置失败: ${newUpstreamPoliciesConfigResponse.status}`,
+    );
+
+    const assertNewUpstreamPolicyRetries = async ({ key, status, payload }) => {
+      const response = await fetch(`http://127.0.0.1:${gatewayPort}/responses`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          model: "policy-test-model",
+          test_response_model: "policy-test-model",
+          test_sequence_key: key,
+          test_transient_error_attempts: 1,
+          test_transient_error_status: status,
+          test_transient_error_payload: payload,
+        }),
+      });
+      assert(
+        response.status === 200 &&
+          upstream.responseRequests.filter((entry) => entry.body?.test_sequence_key === key).length === 2,
+        `${key} 应在同一客户端连接内重试后恢复: ${response.status}`,
+      );
+    };
+
+    await assertNewUpstreamPolicyRetries({
+      key: "model-unavailable-200-envelope-then-ok",
+      status: 200,
+      payload: { error: "模型 'gpt-5.6-sol' 未配置或不可用" },
+    });
+    for (const status of [502, 503]) {
+      await assertNewUpstreamPolicyRetries({
+        key: `http-${status}-policy-then-ok`,
+        status,
+        payload: { error: { message: "upstream gateway failed" } },
+      });
+    }
+    await assertNewUpstreamPolicyRetries({
+      key: "other-http-4xx-policy-then-ok",
+      status: 400,
+      payload: { error: { message: "request cannot be processed" } },
+    });
+    await assertNewUpstreamPolicyRetries({
+      key: "other-http-5xx-policy-then-ok",
+      status: 501,
+      payload: { error: { message: "upstream feature unavailable" } },
+    });
+    await assertNewUpstreamPolicyRetries({
+      key: "error-message-fallback-200-envelope-then-ok",
+      status: 200,
+      payload: { error: { message: "代理返回了未分类错误" } },
+    });
+
+    const http429ExclusionKey = "http-429-must-not-use-other-4xx";
+    const http429ExclusionResponse = await fetch(
+      `http://127.0.0.1:${gatewayPort}/responses`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          model: "policy-test-model",
+          test_sequence_key: http429ExclusionKey,
+          test_http_429_attempts: 1,
+        }),
+      },
+    );
+    assert(
+      http429ExclusionResponse.status === 429 &&
+        upstream.responseRequests.filter(
+          (entry) => entry.body?.test_sequence_key === http429ExclusionKey,
+        ).length === 1,
+      `HTTP 429 不得落入其他 4xx 策略: ${http429ExclusionResponse.status}`,
+    );
+
+    const disableModelUnavailablePolicyResponse = await fetch(
+      `http://127.0.0.1:${gatewayPort}/__codex_retry_gateway/api/config`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ model_unavailable_error_action: "pass_through" }),
+      },
+    );
+    assert(
+      disableModelUnavailablePolicyResponse.status === 200,
+      "关闭模型未配置/不可用策略失败",
+    );
+    const disabledModelUnavailableKey = "model-unavailable-policy-disabled";
+    const disabledModelUnavailableResponse = await fetch(
+      `http://127.0.0.1:${gatewayPort}/responses`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          model: "policy-test-model",
+          test_sequence_key: disabledModelUnavailableKey,
+          test_transient_error_attempts: 1,
+          test_transient_error_status: 200,
+          test_transient_error_payload: {
+            error: "模型 'gpt-5.6-sol' 未配置或不可用",
+          },
+        }),
+      },
+    );
+    assert(
+      disabledModelUnavailableResponse.status === 200 &&
+        upstream.responseRequests.filter(
+          (entry) => entry.body?.test_sequence_key === disabledModelUnavailableKey,
+        ).length === 1,
+      "关闭模型未配置/不可用策略后不应重放请求",
+    );
+
+    const restoreNewUpstreamPoliciesResponse = await fetch(
+      `http://127.0.0.1:${gatewayPort}/__codex_retry_gateway/api/config`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          model_unavailable_error_action: "pass_through",
+          http_502_503_error_action: "pass_through",
+          other_http_4xx_error_action: "pass_through",
+          other_http_5xx_error_action: "pass_through",
+          error_message_fallback_action: "pass_through",
+        }),
+      },
+    );
+    assert(
+      restoreNewUpstreamPoliciesResponse.status === 200,
+      "新增上游错误策略用例后恢复透传配置失败",
+    );
 
     await runUpstreamPolicyCase({
       key: "stream-capacity-text-plain-return-502",
@@ -8196,7 +8847,7 @@ async function run() {
         "      while (Date.now() < releaseAt) {}",
         "    }, delay);",
         "  }",
-        "  if (numericDelay >= 300 && numericDelay <= 500) {",
+        "  if (numericDelay >= 300 && numericDelay <= 550) {",
         "    return originalSetTimeout(callback, 800, ...args);",
         "  }",
         "  const delayedFirstProgressBucket = numericDelay >= 43 && numericDelay <= 45",
@@ -8647,24 +9298,6 @@ async function run() {
       );
       const delayedMetadataChunkTimes =
         delayedMetadataUpstreamRequest?.stream_chunk_sent_at_ms || [];
-      assert(
-        delayedMetadataResponse.status === 502 &&
-          delayedMetadataElapsedMs >= 500 &&
-          delayedMetadataElapsedMs < 700 &&
-          delayedMetadataChunkTimes.length >= 2 &&
-          delayedMetadataChunkTimes.some(
-            (sentAtMs) => sentAtMs - delayedMetadataUpstreamRequest.received_at_ms < 500,
-          ) &&
-          delayedMetadataChunkTimes.some(
-            (sentAtMs) => sentAtMs - delayedMetadataUpstreamRequest.received_at_ms >= 500,
-          ),
-        `前序 lifecycle 必须实际在 deadline 前发送，后续 chunk 首次跨线并立即超时: ${JSON.stringify({
-          status: delayedMetadataResponse.status,
-          elapsed_ms: delayedMetadataElapsedMs,
-          upstream_received_at_ms: delayedMetadataUpstreamRequest?.received_at_ms ?? null,
-          stream_chunk_sent_at_ms: delayedMetadataChunkTimes,
-        })}`,
-      );
       const delayedMetadataAnalytics = await fetch(
         `http://127.0.0.1:${completionDeadlineGatewayPort}/__codex_retry_gateway/api/analytics/reasoning`,
       ).then((response) => response.json());
@@ -8673,6 +9306,32 @@ async function run() {
           `${sample.request_payload_excerpt || ""}`.includes(
             "delayed-first-progress-metadata-wall-clock",
           ),
+      );
+      const delayedMetadataDeadlineAtMs = Number.isFinite(
+        delayedMetadataSample?.upstream_fetch_started_at_ms,
+      )
+        ? delayedMetadataSample.upstream_fetch_started_at_ms + 500
+        : null;
+      assert(
+        delayedMetadataResponse.status === 502 &&
+          delayedMetadataElapsedMs >= 500 &&
+          delayedMetadataElapsedMs < 700 &&
+          delayedMetadataChunkTimes.length >= 2 &&
+          Number.isFinite(delayedMetadataDeadlineAtMs) &&
+          delayedMetadataChunkTimes.some(
+            (sentAtMs) => sentAtMs < delayedMetadataDeadlineAtMs,
+          ) &&
+          delayedMetadataChunkTimes.some(
+            (sentAtMs) => sentAtMs >= delayedMetadataDeadlineAtMs,
+          ),
+        `前序 lifecycle 必须实际在 deadline 前发送，后续 chunk 首次跨线并立即超时: ${JSON.stringify({
+          status: delayedMetadataResponse.status,
+          elapsed_ms: delayedMetadataElapsedMs,
+          upstream_received_at_ms: delayedMetadataUpstreamRequest?.received_at_ms ?? null,
+          upstream_fetch_started_at_ms: delayedMetadataSample?.upstream_fetch_started_at_ms ?? null,
+          deadline_at_ms: delayedMetadataDeadlineAtMs,
+          stream_chunk_sent_at_ms: delayedMetadataChunkTimes,
+        })}`,
       );
       assert(
         Number.isFinite(delayedMetadataSample?.first_stream_chunk_at_ms) &&
@@ -11050,9 +11709,11 @@ async function run() {
         body: JSON.stringify({ guard_retry_attempts: 1 }),
       },
     );
+    const restoreSingleHopContinuationConfigBody =
+      await restoreSingleHopContinuationConfigResponse.text();
     assert(
       restoreSingleHopContinuationConfigResponse.status === 200,
-      `恢复单跳续写测试配置失败: ${restoreSingleHopContinuationConfigResponse.status}`,
+      `恢复单跳续写测试配置失败: status=${restoreSingleHopContinuationConfigResponse.status} body=${restoreSingleHopContinuationConfigBody}`,
     );
 
     const continuationSnapshotMixedKey = "continuation-output-snapshot-mixed-516-then-128";
@@ -11505,6 +12166,588 @@ async function run() {
     assert(
       recoveredBody?.retry_attempt === 2,
       "首次 fetch failed 后未命中第二次上游请求",
+    );
+
+    const transientRetryConfigResponse = await fetch(
+      `http://127.0.0.1:${gatewayPort}/__codex_retry_gateway/api/config`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          intercept_rule_mode: "reasoning_tokens",
+          reasoning_match_mode: "formula_518n_minus_2",
+          reasoning_equals: [516],
+          stream_action: "strict_502",
+          intercept_streaming: true,
+          intercept_non_streaming: true,
+          guard_retry_attempts: 0,
+          transient_retry: {
+            enabled: true,
+            initial_delay_ms: 0,
+            max_delay_ms: 0,
+          },
+        }),
+      },
+    );
+    assert(
+      transientRetryConfigResponse.status === 200 &&
+        transientRetryConfigResponse.ok,
+      `临时故障自动恢复配置失败: ${transientRetryConfigResponse.status}`,
+    );
+
+    const invalidTransientRetryConfigResponse = await fetch(
+      `http://127.0.0.1:${gatewayPort}/__codex_retry_gateway/api/config`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          transient_retry: {
+            enabled: true,
+            initial_delay_ms: 1000,
+            max_delay_ms: 600001,
+          },
+        }),
+      },
+    );
+    assert(
+      invalidTransientRetryConfigResponse.status === 400,
+      `临时重试最大退避超过 10 分钟必须被拒绝: ${invalidTransientRetryConfigResponse.status}`,
+    );
+
+    for (const status of [429, 500, 502, 503, 504]) {
+      const transientHttpKey = `transient-http-${status}-then-ok`;
+      const transientHttpResponse = await fetch(
+        `http://127.0.0.1:${gatewayPort}/responses`,
+        {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            test_sequence_key: transientHttpKey,
+            test_transient_error_attempts: 1,
+            test_transient_error_status: status,
+          }),
+        },
+      );
+      assert(
+        transientHttpResponse.status === 200 &&
+          upstream.responseRequests.filter(
+            (entry) => entry.body?.test_sequence_key === transientHttpKey,
+          ).length === 2,
+        `临时 HTTP ${status} 应在同一客户端连接内自动恢复: ${transientHttpResponse.status}`,
+      );
+    }
+
+    const quotaRetryKey = "structured-quota-429-then-ok";
+    const quotaRetryResponse = await fetch(
+      `http://127.0.0.1:${gatewayPort}/responses`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          test_sequence_key: quotaRetryKey,
+          test_transient_error_attempts: 2,
+          test_transient_error_status: 429,
+          test_transient_error_payload: {
+            error: {
+              type: "insufficient_quota",
+              code: "billing_hard_limit_reached",
+              message: "You exceeded your current quota and token budget.",
+            },
+          },
+        }),
+      },
+    );
+    assert(
+      quotaRetryResponse.status === 200 &&
+        upstream.responseRequests.filter(
+          (entry) => entry.body?.test_sequence_key === quotaRetryKey,
+        ).length === 3,
+      `结构化额度或 token budget 429 应自动恢复: ${quotaRetryResponse.status}`,
+    );
+
+    const plainTextQuotaRetryKey = "plain-text-quota-400-then-ok";
+    const plainTextQuotaRetryResponse = await fetch(
+      `http://127.0.0.1:${gatewayPort}/responses`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          test_sequence_key: plainTextQuotaRetryKey,
+          test_transient_error_attempts: 1,
+          test_transient_error_status: 400,
+          test_transient_error_content_type: "text/plain; charset=utf-8",
+          test_transient_error_raw_body: "insufficient_quota: token budget exceeded",
+        }),
+      },
+    );
+    assert(
+      plainTextQuotaRetryResponse.status === 200 &&
+        upstream.responseRequests.filter(
+          (entry) => entry.body?.test_sequence_key === plainTextQuotaRetryKey,
+        ).length === 2,
+      `纯文本额度或 token budget 错误应自动恢复: ${plainTextQuotaRetryResponse.status}`,
+    );
+
+    const quotaEnvelopeRetryKey = "structured-quota-200-envelope-then-ok";
+    const quotaEnvelopeRetryResponse = await fetch(
+      `http://127.0.0.1:${gatewayPort}/responses`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          test_sequence_key: quotaEnvelopeRetryKey,
+          test_transient_error_attempts: 1,
+          test_transient_error_status: 200,
+          test_transient_error_payload: {
+            error: {
+              type: "insufficient_quota",
+              code: "token_budget_exceeded",
+              message: "Your token budget and available balance are exhausted.",
+            },
+          },
+        }),
+      },
+    );
+    assert(
+      quotaEnvelopeRetryResponse.status === 200 &&
+        upstream.responseRequests.filter(
+          (entry) => entry.body?.test_sequence_key === quotaEnvelopeRetryKey,
+        ).length === 2,
+      `HTTP 200 的结构化额度或 token budget 错误包络应自动恢复: ${quotaEnvelopeRetryResponse.status}`,
+    );
+
+    const normalBudgetMentionKey = "normal-200-output-mentions-token-budget";
+    const normalBudgetMentionResponse = await fetch(
+      `http://127.0.0.1:${gatewayPort}/responses`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          test_sequence_key: normalBudgetMentionKey,
+          test_response_output_text_sequence: [
+            "A normal model response can mention token budget without indicating an API error.",
+            "unexpected retry",
+          ],
+        }),
+      },
+    );
+    const normalBudgetMentionBody = await normalBudgetMentionResponse.json();
+    assert(
+      normalBudgetMentionResponse.status === 200 &&
+        normalBudgetMentionBody?.output_text?.includes("token budget") &&
+        upstream.responseRequests.filter(
+          (entry) => entry.body?.test_sequence_key === normalBudgetMentionKey,
+        ).length === 1,
+      `正常回答提及 token budget 不应触发临时重试: ${JSON.stringify(normalBudgetMentionBody)}`,
+    );
+
+    const nonQuotaErrorBudgetMentionKey = "non-quota-error-body-mentions-token-budget";
+    const nonQuotaErrorBudgetMentionResponse = await fetch(
+      `http://127.0.0.1:${gatewayPort}/responses`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          test_sequence_key: nonQuotaErrorBudgetMentionKey,
+          test_error_status: 400,
+          test_error_payload: {
+            error: {
+              type: "invalid_request_error",
+              code: "invalid_parameter",
+              message: "The request contains an invalid parameter.",
+            },
+            detail: "This documentation discusses token budget but is not a quota failure.",
+          },
+        }),
+      },
+    );
+    assert(
+      nonQuotaErrorBudgetMentionResponse.status === 400 &&
+        upstream.responseRequests.filter(
+          (entry) => entry.body?.test_sequence_key === nonQuotaErrorBudgetMentionKey,
+        ).length === 1,
+      `非额度结构化错误即使其它字段提到 token budget 也不应重试: status=${nonQuotaErrorBudgetMentionResponse.status}`,
+    );
+
+    const nonCapacityErrorMentionKey = "non-capacity-error-body-mentions-capacity";
+    const nonCapacityErrorMentionResponse = await fetch(
+      `http://127.0.0.1:${gatewayPort}/responses`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          test_sequence_key: nonCapacityErrorMentionKey,
+          test_transient_error_attempts: 1,
+          test_transient_error_status: 200,
+          test_transient_error_payload: {
+            error: {
+              type: "invalid_request_error",
+              code: "invalid_parameter",
+              message: "The request contains an invalid parameter.",
+            },
+            detail: "This documentation mentions selected model is at capacity but is not an API capacity failure.",
+          },
+        }),
+      },
+    );
+    const nonCapacityErrorMentionBody = await nonCapacityErrorMentionResponse.json();
+    assert(
+      nonCapacityErrorMentionResponse.status === 200 &&
+        nonCapacityErrorMentionBody?.error?.code === "invalid_parameter" &&
+        upstream.responseRequests.filter(
+          (entry) => entry.body?.test_sequence_key === nonCapacityErrorMentionKey,
+        ).length === 1,
+      `非容量结构化错误即使其它字段提到 capacity 也不应重试: ${JSON.stringify(nonCapacityErrorMentionBody)}`,
+    );
+
+    const jsonStringCapacityMentionKey = "json-string-mentions-capacity-without-error-envelope";
+    const jsonStringCapacityMentionResponse = await fetch(
+      `http://127.0.0.1:${gatewayPort}/responses`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          test_sequence_key: jsonStringCapacityMentionKey,
+          test_transient_error_attempts: 1,
+          test_transient_error_status: 400,
+          test_transient_error_content_type: "application/json; charset=utf-8",
+          test_transient_error_raw_body: JSON.stringify(
+            "Documentation mentions selected model is at capacity, but this is not an error envelope.",
+          ),
+        }),
+      },
+    );
+    const jsonStringCapacityMentionBody = await jsonStringCapacityMentionResponse.text();
+    assert(
+      jsonStringCapacityMentionResponse.status === 400 &&
+        jsonStringCapacityMentionBody.includes("not an error envelope") &&
+        upstream.responseRequests.filter(
+          (entry) => entry.body?.test_sequence_key === jsonStringCapacityMentionKey,
+        ).length === 1,
+      `可解析 JSON 字符串提及 capacity 不应触发临时重试: status=${jsonStringCapacityMentionResponse.status} body=${jsonStringCapacityMentionBody}`,
+    );
+
+    const nestedCapacityDetailMentionKey = "structured-error-detail-mentions-capacity";
+    const nestedCapacityDetailMentionResponse = await fetch(
+      `http://127.0.0.1:${gatewayPort}/responses`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          test_sequence_key: nestedCapacityDetailMentionKey,
+          test_transient_error_attempts: 1,
+          test_transient_error_status: 400,
+          test_transient_error_payload: {
+            error: {
+              type: "invalid_request_error",
+              code: "invalid_parameter",
+              message: "The request contains an invalid parameter.",
+              details: "This detail mentions selected model is at capacity but is not a capacity failure.",
+            },
+          },
+        }),
+      },
+    );
+    const nestedCapacityDetailMentionBody = await nestedCapacityDetailMentionResponse.json();
+    assert(
+      nestedCapacityDetailMentionResponse.status === 400 &&
+        nestedCapacityDetailMentionBody?.error?.code === "invalid_parameter" &&
+        upstream.responseRequests.filter(
+          (entry) => entry.body?.test_sequence_key === nestedCapacityDetailMentionKey,
+        ).length === 1,
+      `结构化 error 的非标准 details 提及 capacity 不应触发临时重试: ${JSON.stringify(nestedCapacityDetailMentionBody)}`,
+    );
+
+    const connectionRetryKey = "connection-interrupted-twice-then-ok";
+    const connectionRetryResponse = await fetch(
+      `http://127.0.0.1:${gatewayPort}/responses`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          test_sequence_key: connectionRetryKey,
+          test_fail_before_response_attempts: 2,
+        }),
+      },
+    );
+    assert(
+      connectionRetryResponse.status === 200 &&
+        upstream.responseRequests.filter(
+          (entry) => entry.body?.test_sequence_key === connectionRetryKey,
+        ).length === 3,
+      `连接中断两次后应自动恢复，不应中断客户端请求: ${connectionRetryResponse.status}`,
+    );
+
+    const streamTerminationRetryKey = "stream-terminated-before-forward-then-ok";
+    const streamTerminationRetryResponse = await readSseUntilClose(
+      `http://127.0.0.1:${gatewayPort}/responses`,
+      {
+        stream: true,
+        test_sequence_key: streamTerminationRetryKey,
+        test_force_terminate_before_progress_attempts: 2,
+      },
+    );
+    assert(
+      streamTerminationRetryResponse.status === 200 &&
+        streamTerminationRetryResponse.text.includes("[DONE]") &&
+        !streamTerminationRetryResponse.closedByError &&
+        upstream.responseRequests.filter(
+          (entry) => entry.body?.test_sequence_key === streamTerminationRetryKey,
+        ).length === 3,
+      `未向客户端首写前的流式中断应自动恢复: ${JSON.stringify(streamTerminationRetryResponse)}`,
+    );
+
+    const streamModelUnavailablePolicyConfigResponse = await fetch(
+      `http://127.0.0.1:${gatewayPort}/__codex_retry_gateway/api/config`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          intercept_rule_mode: "none",
+          guard_retry_attempts: 1,
+          transient_retry: {
+            enabled: false,
+            initial_delay_ms: 0,
+            max_delay_ms: 0,
+          },
+          model_unavailable_error_action: "retry_then_pass_through",
+          error_message_fallback_action: "retry_then_pass_through",
+        }),
+      },
+    );
+    assert(
+      streamModelUnavailablePolicyConfigResponse.status === 200,
+      "流式模型未配置/不可用策略配置失败",
+    );
+    const streamModelUnavailablePolicyKey =
+      "stream-model-unavailable-before-forward-then-ok";
+    const streamModelUnavailablePolicyResponse = await readSseUntilClose(
+      `http://127.0.0.1:${gatewayPort}/responses`,
+      {
+        stream: true,
+        model: "policy-test-model",
+        test_response_model: "policy-test-model",
+        test_sequence_key: streamModelUnavailablePolicyKey,
+        test_stream_transient_error_attempts: 1,
+        test_stream_transient_error_payload: "模型 'gpt-5.6-sol' 未配置或不可用",
+      },
+    );
+    assert(
+      streamModelUnavailablePolicyResponse.status === 200 &&
+        streamModelUnavailablePolicyResponse.text.includes("[DONE]") &&
+        !streamModelUnavailablePolicyResponse.text.includes("未配置或不可用") &&
+        !streamModelUnavailablePolicyResponse.closedByError &&
+        upstream.responseRequests.filter(
+          (entry) => entry.body?.test_sequence_key === streamModelUnavailablePolicyKey,
+        ).length === 2,
+      `首写前的流式模型未配置/不可用错误应由策略重试恢复: ${JSON.stringify(streamModelUnavailablePolicyResponse)}`,
+    );
+    const streamCompletedErrorPayloadKey =
+      "stream-completed-error-message-must-not-retry";
+    const streamCompletedErrorPayloadResponse = await readSseUntilClose(
+      `http://127.0.0.1:${gatewayPort}/responses`,
+      {
+        stream: true,
+        test_sequence_key: streamCompletedErrorPayloadKey,
+        test_stream_completed_error_payload: {
+          message: "completed metadata is not a retryable failure",
+        },
+      },
+    );
+    assert(
+      streamCompletedErrorPayloadResponse.status === 200 &&
+        streamCompletedErrorPayloadResponse.text.includes("[DONE]") &&
+        upstream.responseRequests.filter(
+          (entry) => entry.body?.test_sequence_key === streamCompletedErrorPayloadKey,
+        ).length === 1,
+      `非失败终态携带 error.message 不得触发重试: ${JSON.stringify(streamCompletedErrorPayloadResponse)}`,
+    );
+    const restoreTransientRetryAfterStreamPolicyResponse = await fetch(
+      `http://127.0.0.1:${gatewayPort}/__codex_retry_gateway/api/config`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          intercept_rule_mode: "reasoning_tokens",
+          reasoning_match_mode: "formula_518n_minus_2",
+          reasoning_equals: [516],
+          stream_action: "strict_502",
+          intercept_streaming: true,
+          intercept_non_streaming: true,
+          guard_retry_attempts: 0,
+          transient_retry: {
+            enabled: true,
+            initial_delay_ms: 0,
+            max_delay_ms: 0,
+          },
+          model_unavailable_error_action: "pass_through",
+          error_message_fallback_action: "pass_through",
+        }),
+      },
+    );
+    assert(
+      restoreTransientRetryAfterStreamPolicyResponse.status === 200,
+      "流式模型未配置/不可用策略用例后恢复瞬态重试失败",
+    );
+
+    const streamQuotaRetryKey = "stream-structured-quota-before-forward-then-ok";
+    const streamQuotaRetryResponse = await readSseUntilClose(
+      `http://127.0.0.1:${gatewayPort}/responses`,
+      {
+        stream: true,
+        test_sequence_key: streamQuotaRetryKey,
+        test_stream_transient_error_attempts: 1,
+      },
+    );
+    assert(
+      streamQuotaRetryResponse.status === 200 &&
+        streamQuotaRetryResponse.text.includes("[DONE]") &&
+        !streamQuotaRetryResponse.text.includes("insufficient_quota") &&
+        !streamQuotaRetryResponse.closedByError &&
+        upstream.responseRequests.filter(
+          (entry) => entry.body?.test_sequence_key === streamQuotaRetryKey,
+        ).length === 2,
+      `首写前的流式结构化额度错误应自动恢复: ${JSON.stringify(streamQuotaRetryResponse)}`,
+    );
+
+    const transientRetryTotalDeadlineConfigResponse = await fetch(
+      `http://127.0.0.1:${gatewayPort}/__codex_retry_gateway/api/config`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          transient_retry: {
+            enabled: true,
+            initial_delay_ms: 400,
+            max_delay_ms: 400,
+          },
+          latency_guard: {
+            enabled: true,
+            first_progress_timeout_ms: 0,
+            first_progress_action: "return_502",
+            total_timeout_ms: 180,
+          },
+        }),
+      },
+    );
+    assert(
+      transientRetryTotalDeadlineConfigResponse.status === 200,
+      "临时重试总 deadline 配置失败",
+    );
+    const transientRetryTotalDeadlineKey =
+      "transient-retry-total-deadline-before-next-attempt";
+    const transientRetryTotalDeadlineResponse = await fetch(
+      `http://127.0.0.1:${gatewayPort}/responses`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          test_sequence_key: transientRetryTotalDeadlineKey,
+          test_transient_error_attempts: 1,
+          test_transient_error_status: 503,
+        }),
+      },
+    );
+    const transientRetryTotalDeadlineBody =
+      await transientRetryTotalDeadlineResponse.json();
+    assert(
+      transientRetryTotalDeadlineResponse.status === 502 &&
+        transientRetryTotalDeadlineResponse.headers.get("x-codex-retry-gateway-reason") ===
+          "upstream-total-timeout" &&
+        transientRetryTotalDeadlineBody?.error?.code === "upstream_total_timeout" &&
+        upstream.responseRequests.filter(
+          (entry) => entry.body?.test_sequence_key === transientRetryTotalDeadlineKey,
+        ).length === 1,
+      `临时重试到达总 deadline 后不得派发新 attempt: status=${transientRetryTotalDeadlineResponse.status} body=${JSON.stringify(transientRetryTotalDeadlineBody)}`,
+    );
+
+    const transientRetryFirstProgressConfigResponse = await fetch(
+      `http://127.0.0.1:${gatewayPort}/__codex_retry_gateway/api/config`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          transient_retry: {
+            enabled: true,
+            initial_delay_ms: 120,
+            max_delay_ms: 120,
+          },
+          latency_guard: {
+            enabled: true,
+            first_progress_timeout_ms: 60,
+            first_progress_action: "return_502",
+            total_timeout_ms: 0,
+          },
+        }),
+      },
+    );
+    assert(
+      transientRetryFirstProgressConfigResponse.status === 200,
+      "临时重试与首 progress 边界配置失败",
+    );
+
+    const connectionRetryWithFirstProgressKey =
+      "connection-interrupted-before-progress-waits-then-ok";
+    const connectionRetryWithFirstProgressResponse = await fetch(
+      `http://127.0.0.1:${gatewayPort}/responses`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          test_sequence_key: connectionRetryWithFirstProgressKey,
+          test_fail_before_response_attempts: 1,
+        }),
+      },
+    );
+    assert(
+      connectionRetryWithFirstProgressResponse.status === 200 &&
+        upstream.responseRequests.filter(
+          (entry) => entry.body?.test_sequence_key === connectionRetryWithFirstProgressKey,
+        ).length === 2,
+      `建连中断后的临时退避不应被首 progress timer 取消: ${connectionRetryWithFirstProgressResponse.status}`,
+    );
+
+    const streamQuotaRetryWithFirstProgressKey =
+      "stream-quota-before-progress-waits-then-ok";
+    const streamQuotaRetryWithFirstProgressResponse = await readSseUntilClose(
+      `http://127.0.0.1:${gatewayPort}/responses`,
+      {
+        stream: true,
+        test_sequence_key: streamQuotaRetryWithFirstProgressKey,
+        test_stream_transient_error_attempts: 1,
+      },
+    );
+    assert(
+      streamQuotaRetryWithFirstProgressResponse.status === 200 &&
+        streamQuotaRetryWithFirstProgressResponse.text.includes("[DONE]") &&
+        !streamQuotaRetryWithFirstProgressResponse.closedByError &&
+        upstream.responseRequests.filter(
+          (entry) => entry.body?.test_sequence_key === streamQuotaRetryWithFirstProgressKey,
+        ).length === 2,
+      `流式结构化额度故障的临时退避不应被首 progress timer 取消: ${JSON.stringify(streamQuotaRetryWithFirstProgressResponse)}`,
+    );
+
+    const disableTransientRetryConfigResponse = await fetch(
+      `http://127.0.0.1:${gatewayPort}/__codex_retry_gateway/api/config`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          transient_retry: {
+            enabled: false,
+            initial_delay_ms: 0,
+            max_delay_ms: 0,
+          },
+          latency_guard: {
+            enabled: false,
+          },
+          guard_retry_attempts: 3,
+        }),
+      },
+    );
+    assert(
+      disableTransientRetryConfigResponse.status === 200,
+      `临时故障自动恢复测试后关闭策略失败: ${disableTransientRetryConfigResponse.status}`,
     );
 
     const failedResponsesProxy = await fetch(

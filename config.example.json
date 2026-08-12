@@ -14,6 +14,16 @@
   "guard_retry_attempts": 5,
   "capacity_error_action": "retry_then_pass_through",
   "http_429_action": "pass_through",
+  "model_unavailable_error_action": "retry_then_pass_through",
+  "http_502_503_error_action": "retry_then_pass_through",
+  "other_http_4xx_error_action": "retry_then_pass_through",
+  "other_http_5xx_error_action": "retry_then_pass_through",
+  "error_message_fallback_action": "retry_then_pass_through",
+  "transient_retry": {
+    "enabled": true,
+    "initial_delay_ms": 1000,
+    "max_delay_ms": 600000
+  },
   "latency_guard": {
     "enabled": false,
     "first_progress_timeout_ms": 0,

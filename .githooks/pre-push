@@ -1,0 +1,290 @@
+#!/usr/bin/env sh
+# workskill:pre-push-gate:v1 sha256=a281c88efa6fbc3af8d1ac788629a64e01f206471f97ceb1fd77f2766a27bb3b
+set -eu
+
+zero_oid=0000000000000000000000000000000000000000
+remote_name=${1:-}
+remote_url=${2:-}
+authorization_nonce=${WORKSKILL_GIT_DELIVERY_AUTHORIZATION:-}
+authorization_path=
+protected_update_seen=0
+
+authorization_value() {
+  key=$1
+  sed -n "s/^${key}=//p" "$authorization_path"
+}
+
+reject_protected_update() {
+  message=$1
+  echo "$message" >&2
+  exit 1
+}
+
+workskill_scope_present() {
+  [ -n "${WORKSKILL_TASK_ID:-}" ] || [ -n "${WORKSKILL_CONVERSATION_ID:-}" ]
+}
+
+validate_standalone_task_commit() {
+  commit_oid=$1
+  task_slugs=$(git log -1 --format=%B "$commit_oid" | git interpret-trailers --parse | sed -n 's/^Task:[[:space:]]*//p')
+  task_slug_count=$(printf '%s\n' "$task_slugs" | sed '/^[[:space:]]*$/d' | wc -l | tr -d ' ')
+  if [ "$task_slug_count" -ne 1 ]; then
+    reject_protected_update "Standalone main pushes require exactly one Task: <slug> footer in the pushed tip commit."
+  fi
+  task_slug=$(printf '%s\n' "$task_slugs" | sed -n '1{s/^[[:space:]]*//;s/[[:space:]]*$//;p;}')
+  case "$task_slug" in
+    [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]-*|[0-9][0-9]-[0-9][0-9]-*)
+      reject_protected_update "Standalone main pushes require a Task: <slug> footer without a YYYY-MM-DD- or MM-DD- prefix."
+      ;;
+  esac
+  if ! printf '%s\n' "$task_slug" | LC_ALL=C grep -Eq '^[a-z0-9]+(-[a-z0-9]+)*$'; then
+    reject_protected_update "Standalone main push has an unsafe Task footer; use a lowercase kebab-case Task: <slug>."
+  fi
+
+  if [ -L ".tasks" ] || [ ! -d ".tasks" ]; then
+    reject_protected_update "Standalone main pushes require a local .tasks/ task directory."
+  fi
+
+  task_directory=
+  task_directory_count=0
+  for candidate_directory in .tasks/*; do
+    if [ ! -e "$candidate_directory" ] && [ ! -L "$candidate_directory" ]; then
+      continue
+    fi
+    candidate_name=${candidate_directory#".tasks/"}
+    case "$candidate_name" in
+      "$task_slug"|[0-9][0-9]-[0-9][0-9]-"$task_slug"|[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]-"$task_slug")
+        task_directory=$candidate_directory
+        task_directory_count=$((task_directory_count + 1))
+        ;;
+    esac
+  done
+
+  if [ "$task_directory_count" -eq 0 ]; then
+    reject_protected_update "Standalone main push Task slug '$task_slug' did not match .tasks/<slug>/, .tasks/MM-DD-<slug>/, or .tasks/YYYY-MM-DD-<slug>/."
+  fi
+  if [ "$task_directory_count" -ne 1 ]; then
+    reject_protected_update "Standalone main push Task slug '$task_slug' matches multiple directories under .tasks/; keep exactly one compatible task directory."
+  fi
+  if [ -L "$task_directory" ] || [ ! -d "$task_directory" ]; then
+    reject_protected_update "Standalone main push Task slug '$task_slug' must resolve to a non-symlinked directory under .tasks/."
+  fi
+  for task_document in ALIGNMENT CONSENSUS SOLUTION TASK ACCEPTANCE FINAL TODO; do
+    task_document_path="$task_directory/$task_document.md"
+    if [ -L "$task_document_path" ] || [ ! -f "$task_document_path" ] || [ ! -s "$task_document_path" ]; then
+      reject_protected_update "Standalone main push Task '$task_slug' is missing a non-empty regular $task_document.md in '$task_directory'."
+    fi
+  done
+}
+
+validate_standalone_main_push() {
+  local_ref=$1
+  local_oid=$2
+  remote_oid=$3
+
+  if [ "$protected_update_seen" -ne 0 ]; then
+    reject_protected_update "A standalone task fallback can update only one protected ref."
+  fi
+  protected_update_seen=1
+
+  current_branch=$(git symbolic-ref --quiet --short HEAD 2>/dev/null || true)
+  if [ "$current_branch" != "main" ] || [ "$local_ref" != "refs/heads/main" ]; then
+    reject_protected_update "Standalone task fallback requires authoritative local main to be checked out and pushed."
+  fi
+  authoritative_main_oid=$(git rev-parse refs/heads/main 2>/dev/null || true)
+  if [ -z "$authoritative_main_oid" ] || [ "$authoritative_main_oid" != "$local_oid" ]; then
+    reject_protected_update "Standalone task fallback does not match authoritative local main."
+  fi
+  if [ "$local_oid" = "$zero_oid" ]; then
+    reject_protected_update "Standalone task fallback cannot delete remote main."
+  fi
+
+  configured_delivery_mode=$(sed -n '1p' .workskill/git-delivery-mode 2>/dev/null || true)
+  case "$configured_delivery_mode" in
+    "") ;;
+    quick_mainline) ;;
+    standard_pr) reject_protected_update "Standard PR mode requires the configured Pull Request delivery route." ;;
+    *) reject_protected_update "The local Git delivery mode is invalid; run WorkSkill init before pushing." ;;
+  esac
+
+  if [ "$remote_oid" != "$zero_oid" ]; then
+    if ! git cat-file -e "$remote_oid^{commit}" 2>/dev/null; then
+      reject_protected_update "Standalone task fallback cannot verify the remote main base."
+    fi
+    if ! git merge-base --is-ancestor "$remote_oid" "$local_oid"; then
+      reject_protected_update "Standalone task fallback only allows fast-forward updates to remote main."
+    fi
+  fi
+
+  validate_standalone_task_commit "$local_oid"
+}
+
+validate_authorization() {
+  expected_kind=$1
+  local_ref=$2
+  local_oid=$3
+  remote_ref=$4
+  remote_oid=$5
+
+  if [ "$protected_update_seen" -ne 0 ]; then
+    reject_protected_update "A one-time Git delivery authorization can update only one protected ref."
+  fi
+  protected_update_seen=1
+
+  case "$authorization_nonce" in
+    ""|*[!A-Za-z0-9_-]*)
+      authorization_path=
+      ;;
+    *)
+      git_common_dir=$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null || true)
+      authorization_path="$git_common_dir/workskill/git-delivery-authorizations/$authorization_nonce"
+      ;;
+  esac
+
+  if [ -z "$authorization_path" ] || [ ! -f "$authorization_path" ] || [ -L "$authorization_path" ] || [ -e "$authorization_path.used" ]; then
+    if [ "$expected_kind" = "tag_push" ]; then
+      reject_protected_update "Formal tag pushes require a valid one-time Git delivery authorization."
+    fi
+    reject_protected_update "Direct pushes to remote main require a valid one-time Git delivery authorization."
+  fi
+
+  version=$(authorization_value version)
+  kind=$(authorization_value kind)
+  delivery_mode=$(authorization_value delivery_mode)
+  authorized_remote_name=$(authorization_value remote_name)
+  authorized_remote_url=$(authorization_value remote_url)
+  target_ref=$(authorization_value target_ref)
+  expected_remote_oid=$(authorization_value expected_remote_oid)
+  expected_local_oid=$(authorization_value expected_local_oid)
+  expires_at_epoch=$(authorization_value expires_at_epoch)
+  current_epoch=$(date +%s)
+
+  case "$expires_at_epoch" in
+    ""|*[!0-9]*) reject_protected_update "The Git delivery authorization is invalid or expired." ;;
+  esac
+  if [ "$version" != "1" ] || [ "$kind" != "$expected_kind" ] || [ "$authorized_remote_name" != "$remote_name" ] \
+    || [ "$authorized_remote_url" != "$remote_url" ] || [ "$target_ref" != "$remote_ref" ] \
+    || [ "$expected_remote_oid" != "$remote_oid" ] || [ "$expected_local_oid" != "$local_oid" ]; then
+    reject_protected_update "The Git delivery authorization does not match this push."
+  fi
+  if [ "$expires_at_epoch" -le "$current_epoch" ]; then
+    reject_protected_update "The Git delivery authorization is invalid or expired."
+  fi
+  if [ "$expected_kind" = "main_push" ] && [ "$delivery_mode" != "quick_mainline" ]; then
+    reject_protected_update "Standard PR mode never authorizes a direct remote main push."
+  fi
+  if [ "$delivery_mode" != "quick_mainline" ] && [ "$delivery_mode" != "standard_pr" ]; then
+    reject_protected_update "The Git delivery authorization contains an invalid delivery mode."
+  fi
+  current_branch=$(git symbolic-ref --quiet --short HEAD 2>/dev/null || true)
+  if [ "$current_branch" != "main" ]; then
+    reject_protected_update "Protected refs can be pushed only while authoritative local main is checked out."
+  fi
+  if [ "$expected_kind" = "main_push" ]; then
+    authoritative_main_oid=$(git rev-parse refs/heads/main 2>/dev/null || true)
+    if [ "$local_ref" != "refs/heads/main" ] || [ "$authoritative_main_oid" != "$local_oid" ]; then
+      reject_protected_update "The Git delivery authorization does not match authoritative local main."
+    fi
+  fi
+}
+
+while read -r local_ref local_oid remote_ref remote_oid; do
+  if [ "$local_oid" != "$zero_oid" ]; then
+    if ! git diff --quiet "$local_oid" -- .gitignore ':(glob)**/.gitignore'; then
+      echo "Ignore rules differ from the pushed commit; commit or discard .gitignore changes before pushing." >&2
+      exit 1
+    fi
+
+    managed_paths=$(git ls-tree -r --name-only "$local_oid" -- .workskill)
+    if [ -n "$managed_paths" ]; then
+      echo "The .workskill/ managed directory is local-only; remove it from Git tracking before pushing." >&2
+      echo "Blocked commit: $local_oid" >&2
+      printf '%s\n' "$managed_paths" >&2
+      exit 1
+    fi
+    task_paths=$(git ls-tree -r --name-only "$local_oid" -- .tasks)
+    if [ -n "$task_paths" ]; then
+      echo "The .tasks/ workflow directory is local-only; remove it from Git tracking before pushing." >&2
+      echo "Blocked commit: $local_oid" >&2
+      printf '%s\n' "$task_paths" >&2
+      exit 1
+    fi
+    memory_paths=$(git ls-tree -r --name-only "$local_oid" -- .memory)
+    if [ -n "$memory_paths" ]; then
+      echo "The .memory/ directory is local-only; remove it from Git tracking before pushing." >&2
+      echo "Blocked commit: $local_oid" >&2
+      printf '%s\n' "$memory_paths" >&2
+      exit 1
+    fi
+    ignored_paths=$(git ls-tree -r --name-only "$local_oid" | git check-ignore --no-index --stdin 2>/dev/null || true)
+    if [ -n "$ignored_paths" ]; then
+      echo "Git ignored paths must remain local; remove them from Git tracking before pushing." >&2
+      echo "Blocked commit: $local_oid" >&2
+      printf '%s\n' "$ignored_paths" >&2
+      exit 1
+    fi
+
+    if [ "$remote_oid" = "$zero_oid" ]; then
+      candidate_commits=$(git rev-list "$local_oid" --not --remotes)
+    elif git cat-file -e "$remote_oid^{commit}" 2>/dev/null; then
+      candidate_commits=$(git rev-list "$remote_oid..$local_oid")
+    else
+      candidate_commits=$(git rev-list "$local_oid" --not --remotes)
+    fi
+    for candidate_commit in $candidate_commits; do
+      managed_paths=$(git ls-tree -r --name-only "$candidate_commit" -- .workskill)
+      if [ -n "$managed_paths" ]; then
+        echo "The .workskill/ managed directory is local-only; remove it from Git tracking before pushing." >&2
+        echo "Blocked commit: $candidate_commit" >&2
+        printf '%s\n' "$managed_paths" >&2
+        exit 1
+      fi
+      task_paths=$(git ls-tree -r --name-only "$candidate_commit" -- .tasks)
+      if [ -n "$task_paths" ]; then
+        echo "The .tasks/ workflow directory is local-only; remove it from Git tracking before pushing." >&2
+        echo "Blocked commit: $candidate_commit" >&2
+        printf '%s\n' "$task_paths" >&2
+        exit 1
+      fi
+      memory_paths=$(git ls-tree -r --name-only "$candidate_commit" -- .memory)
+      if [ -n "$memory_paths" ]; then
+        echo "The .memory/ directory is local-only; remove it from Git tracking before pushing." >&2
+        echo "Blocked commit: $candidate_commit" >&2
+        printf '%s\n' "$memory_paths" >&2
+        exit 1
+      fi
+      ignored_paths=$(git ls-tree -r --name-only "$candidate_commit" | git check-ignore --no-index --stdin 2>/dev/null || true)
+      if [ -n "$ignored_paths" ]; then
+        echo "Git ignored paths must remain local; remove them from Git tracking before pushing." >&2
+        echo "Blocked commit: $candidate_commit" >&2
+        printf '%s\n' "$ignored_paths" >&2
+        exit 1
+      fi
+    done
+  fi
+
+  if [ "$remote_ref" = "refs/heads/main" ]; then
+    if workskill_scope_present || [ -n "$authorization_nonce" ]; then
+      validate_authorization "main_push" "$local_ref" "$local_oid" "$remote_ref" "$remote_oid"
+    else
+      validate_standalone_main_push "$local_ref" "$local_oid" "$remote_oid"
+    fi
+    continue
+  fi
+  case "$remote_ref" in
+    refs/tags/*)
+      validate_authorization "tag_push" "$local_ref" "$local_oid" "$remote_ref" "$remote_oid"
+      ;;
+    refs/heads/release/*)
+      reject_protected_update "Direct pushes to protected release branches are blocked; use the configured review route."
+      ;;
+  esac
+done
+
+if [ -n "$authorization_path" ]; then
+  if ! mv "$authorization_path" "$authorization_path.used"; then
+    reject_protected_update "The one-time Git delivery authorization could not be consumed."
+  fi
+fi
+
+exit 0

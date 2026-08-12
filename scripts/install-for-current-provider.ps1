@@ -127,6 +127,7 @@ $gatewayConfig = [ordered]@{
   retry_upstream_capacity_errors = $retryUpstreamCapacityErrors
   capacity_error_action = Normalize-UpstreamErrorAction -Value (Get-OptionalPropertyValue -Object $existingGatewayConfig -Name "capacity_error_action") -DefaultValue $legacyCapacityAction
   http_429_action = Normalize-UpstreamErrorAction -Value (Get-OptionalPropertyValue -Object $existingGatewayConfig -Name "http_429_action") -DefaultValue "pass_through"
+  transient_retry = Normalize-TransientRetry -Value (Get-OptionalPropertyValue -Object $existingGatewayConfig -Name "transient_retry")
   latency_guard = Normalize-LatencyGuard -Value (Get-OptionalPropertyValue -Object $existingGatewayConfig -Name "latency_guard")
   stream_action = if ($legacyContinuationRuleMode) { "continuation_recovery" } elseif ([string]::IsNullOrWhiteSpace($existingStreamAction)) { "continuation_recovery" } else { $existingStreamAction }
   continuation_marker_text = if ([string]::IsNullOrWhiteSpace([string](Get-OptionalPropertyValue -Object $existingGatewayConfig -Name "continuation_marker_text"))) { "Continue thinking..." } else { [string](Get-OptionalPropertyValue -Object $existingGatewayConfig -Name "continuation_marker_text") }
