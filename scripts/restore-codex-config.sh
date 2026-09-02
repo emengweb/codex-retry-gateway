@@ -17,6 +17,10 @@ if command -v node.exe >/dev/null 2>&1; then
     if [[ "$EXPECT_PATH_VALUE" == 1 ]]; then
       if command -v wslpath >/dev/null 2>&1; then
         ARG="$(wslpath -w "$ARG")"
+      elif [[ "$ARG" =~ ^/mnt/([[:alpha:]])/(.*)$ ]]; then
+        DRIVE="${BASH_REMATCH[1]^^}"
+        REST="${BASH_REMATCH[2]//\//\\}"
+        ARG="${DRIVE}:\\${REST}"
       fi
       EXPECT_PATH_VALUE=0
     fi

@@ -5,6 +5,12 @@ import fs from "node:fs";
 import { copyFile, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import {
+  findCompatibleClientUpstream,
+  getDefaultClientConfigPaths,
+  installClientConfigs,
+  restoreClientConfigs,
+} from "./client-configs.mjs";
 
 export const DEFAULT_STATE_ROOT = path.join(os.homedir(), ".codex-retry-gateway");
 export const DEFAULT_CODEX_CONFIG_PATH = path.join(os.homedir(), ".codex", "config.toml");
@@ -264,7 +270,8 @@ function isFilePath(filePath) {
     return false;
   }
   try {
-    return fs.statSync(filePath).isFile();
+    const fileStats = fs.lstatSync(filePath);
+    return fileStats.isFile() && !fileStats.isSymbolicLink();
   } catch {
     return false;
   }
@@ -694,8 +701,141 @@ export async function startGateway({
   return `Gateway started. PID=${child.pid}. Listen=${getGatewayBaseUrl(gatewayConfig.listen_host, gatewayConfig.listen_port)}`;
 }
 
+function buildGatewayInstallConfig({
+  existingGatewayConfig,
+  listenHost,
+  listenPort,
+  upstreamBaseUrl,
+}) {
+  const defaultEndpoints = ["/responses", "/chat/completions", "/v1/responses", "/v1/chat/completions"];
+  const mergedEndpoints = [];
+  for (const endpoint of [
+    ...normalizeStringArray(existingGatewayConfig?.endpoints, []),
+    ...defaultEndpoints,
+  ]) {
+    if (!mergedEndpoints.includes(endpoint)) {
+      mergedEndpoints.push(endpoint);
+    }
+  }
+
+  const legacyContinuationRuleMode = isLegacyContinuationRuleMode(
+    existingGatewayConfig?.intercept_rule_mode,
+  );
+  const retryUpstreamCapacityErrors = existingGatewayConfig?.retry_upstream_capacity_errors !== false;
+  const legacyCapacityAction = retryUpstreamCapacityErrors
+    ? DEFAULT_CAPACITY_ERROR_ACTION
+    : "pass_through";
+  return {
+    listen_host: listenHost,
+    listen_port: listenPort,
+    upstream_base_url: upstreamBaseUrl,
+    request_body_limit_bytes: normalizeRequestBodyLimitBytes(existingGatewayConfig?.request_body_limit_bytes),
+    endpoints: mergedEndpoints,
+    intercept_rule_mode: legacyContinuationRuleMode
+      ? DEFAULT_INTERCEPT_RULE_MODE
+      : normalizeInterceptRuleMode(existingGatewayConfig?.intercept_rule_mode),
+    reasoning_match_mode: normalizeReasoningMatchMode(existingGatewayConfig?.reasoning_match_mode),
+    reasoning_equals: normalizeIntArray(existingGatewayConfig?.reasoning_equals, [516, 1034, 1552]),
+    intercept_streaming:
+      existingGatewayConfig?.intercept_streaming === undefined ? true : Boolean(existingGatewayConfig.intercept_streaming),
+    intercept_non_streaming:
+      existingGatewayConfig?.intercept_non_streaming === undefined
+        ? true
+        : Boolean(existingGatewayConfig.intercept_non_streaming),
+    non_stream_status_code:
+      existingGatewayConfig?.non_stream_status_code === undefined || existingGatewayConfig?.non_stream_status_code === null
+        ? 502
+        : Number.parseInt(`${existingGatewayConfig.non_stream_status_code}`, 10),
+    guard_retry_attempts: normalizeGuardRetryAttempts(existingGatewayConfig?.guard_retry_attempts),
+    retry_upstream_capacity_errors: retryUpstreamCapacityErrors,
+    capacity_error_action: normalizeUpstreamErrorAction(
+      existingGatewayConfig?.capacity_error_action,
+      legacyCapacityAction,
+    ),
+    http_429_action: normalizeUpstreamErrorAction(
+      existingGatewayConfig?.http_429_action,
+      DEFAULT_HTTP_429_ACTION,
+    ),
+    transient_retry: normalizeTransientRetryConfig(existingGatewayConfig?.transient_retry),
+    latency_guard: normalizeLatencyGuardConfig(existingGatewayConfig?.latency_guard),
+    stream_action: legacyContinuationRuleMode
+      ? CONTINUATION_RECOVERY_STREAM_ACTION
+      : existingGatewayConfig?.stream_action || DEFAULT_STREAM_ACTION,
+    continuation_marker_text: normalizeContinuationMarkerText(
+      existingGatewayConfig?.continuation_marker_text,
+    ),
+    log_match: existingGatewayConfig?.log_match === undefined ? true : Boolean(existingGatewayConfig.log_match),
+    health_path: existingGatewayConfig?.health_path || DEFAULT_HEALTH_PATH,
+  };
+}
+
+function isRestorableTargetPath(filePath) {
+  if (!filePath) {
+    return true;
+  }
+  try {
+    const fileStats = fs.lstatSync(filePath);
+    return fileStats.isFile() && !fileStats.isSymbolicLink();
+  } catch (error) {
+    return error?.code === "ENOENT";
+  }
+}
+
+function buildClientRestoreRollbackRecords(records) {
+  return records.map((record) => ({
+    ...record,
+    originalBaseUrl: record.gatewayBaseUrl,
+    gatewayBaseUrl: record.originalBaseUrl,
+  }));
+}
+
+function getClientConfigRecordKey(record) {
+  return `${record.filePath || ""}\u0000${JSON.stringify(record.fieldPath || [])}`;
+}
+
+async function installManagedClientConfigs({
+  clientConfigPaths,
+  upstreamBaseUrl,
+  gatewayBaseUrl,
+  backupDir,
+  existingClientConfigs,
+}) {
+  const result = await installClientConfigs({
+    clientConfigPaths,
+    upstreamBaseUrl,
+    gatewayBaseUrl,
+    backupDir,
+  });
+  const existingRecords = Array.isArray(existingClientConfigs?.records)
+    ? existingClientConfigs.records
+    : [];
+  const records = [...existingRecords];
+  const knownRecords = new Set(records.map(getClientConfigRecordKey));
+  for (const record of result.records) {
+    if (!knownRecords.has(getClientConfigRecordKey(record))) {
+      records.push(record);
+      knownRecords.add(getClientConfigRecordKey(record));
+    }
+  }
+  if (result.records.length === 0) {
+    return {
+      newRecords: [],
+      state: existingClientConfigs || null,
+    };
+  }
+  return {
+    newRecords: result.records,
+    state: {
+      records,
+      skipped: result.skipped,
+      updated_at: new Date().toISOString(),
+    },
+  };
+}
+
 async function applyInstallForCurrentProvider({
   codexConfigPath = DEFAULT_CODEX_CONFIG_PATH,
+  clientConfigPaths = getDefaultClientConfigPaths(),
   stateRoot = DEFAULT_STATE_ROOT,
   listenHost = DEFAULT_LISTEN_HOST,
   listenPort = DEFAULT_LISTEN_PORT,
@@ -747,75 +887,34 @@ async function applyInstallForCurrentProvider({
     await copyFile(codexConfigPath, backupPath);
   }
 
-  const defaultEndpoints = ["/responses", "/chat/completions", "/v1/responses", "/v1/chat/completions"];
-  const mergedEndpoints = [];
-  for (const endpoint of [
-    ...normalizeStringArray(existingGatewayConfig?.endpoints, []),
-    ...defaultEndpoints,
-  ]) {
-    if (!mergedEndpoints.includes(endpoint)) {
-      mergedEndpoints.push(endpoint);
-    }
-  }
-
-  const legacyContinuationRuleMode = isLegacyContinuationRuleMode(
-    existingGatewayConfig?.intercept_rule_mode,
-  );
-  const retryUpstreamCapacityErrors = existingGatewayConfig?.retry_upstream_capacity_errors !== false;
-  const legacyCapacityAction = retryUpstreamCapacityErrors
-    ? DEFAULT_CAPACITY_ERROR_ACTION
-    : "pass_through";
-  const gatewayConfig = {
-    listen_host: listenHost,
-    listen_port: listenPort,
-    upstream_base_url: originalBaseUrl,
-    request_body_limit_bytes: normalizeRequestBodyLimitBytes(existingGatewayConfig?.request_body_limit_bytes),
-    endpoints: mergedEndpoints,
-    intercept_rule_mode: legacyContinuationRuleMode
-      ? DEFAULT_INTERCEPT_RULE_MODE
-      : normalizeInterceptRuleMode(existingGatewayConfig?.intercept_rule_mode),
-    reasoning_match_mode: normalizeReasoningMatchMode(existingGatewayConfig?.reasoning_match_mode),
-    reasoning_equals: normalizeIntArray(existingGatewayConfig?.reasoning_equals, [516, 1034, 1552]),
-    intercept_streaming:
-      existingGatewayConfig?.intercept_streaming === undefined ? true : Boolean(existingGatewayConfig.intercept_streaming),
-    intercept_non_streaming:
-      existingGatewayConfig?.intercept_non_streaming === undefined
-        ? true
-        : Boolean(existingGatewayConfig.intercept_non_streaming),
-    non_stream_status_code:
-      existingGatewayConfig?.non_stream_status_code === undefined || existingGatewayConfig?.non_stream_status_code === null
-        ? 502
-        : Number.parseInt(`${existingGatewayConfig.non_stream_status_code}`, 10),
-    guard_retry_attempts: normalizeGuardRetryAttempts(existingGatewayConfig?.guard_retry_attempts),
-    retry_upstream_capacity_errors: retryUpstreamCapacityErrors,
-    capacity_error_action: normalizeUpstreamErrorAction(
-      existingGatewayConfig?.capacity_error_action,
-      legacyCapacityAction,
-    ),
-    http_429_action: normalizeUpstreamErrorAction(
-      existingGatewayConfig?.http_429_action,
-      DEFAULT_HTTP_429_ACTION,
-    ),
-    transient_retry: normalizeTransientRetryConfig(existingGatewayConfig?.transient_retry),
-    latency_guard: normalizeLatencyGuardConfig(existingGatewayConfig?.latency_guard),
-    stream_action: legacyContinuationRuleMode
-      ? CONTINUATION_RECOVERY_STREAM_ACTION
-      : existingGatewayConfig?.stream_action || DEFAULT_STREAM_ACTION,
-    continuation_marker_text: normalizeContinuationMarkerText(
-      existingGatewayConfig?.continuation_marker_text,
-    ),
-    log_match: existingGatewayConfig?.log_match === undefined ? true : Boolean(existingGatewayConfig.log_match),
-    health_path: existingGatewayConfig?.health_path || DEFAULT_HEALTH_PATH,
-  };
+  const gatewayConfig = buildGatewayInstallConfig({
+    existingGatewayConfig,
+    listenHost,
+    listenPort,
+    upstreamBaseUrl: originalBaseUrl,
+  });
 
   const previousConfigContent = await readFile(codexConfigPath, "utf8");
+  const previousGatewayConfigContent = fs.existsSync(paths.configPath)
+    ? await readFile(paths.configPath, "utf8")
+    : null;
+  let gatewayConfigWritten = false;
+  let clientConfigInstall = null;
 
   try {
     await writeJsonFile(paths.configPath, gatewayConfig);
+    gatewayConfigWritten = true;
     await setCodexProviderBaseUrl({
       codexConfigPath,
       providerName: providerContext.providerName,
       newBaseUrl: localGatewayBaseUrl,
+    });
+    clientConfigInstall = await installManagedClientConfigs({
+      clientConfigPaths,
+      upstreamBaseUrl: originalBaseUrl,
+      gatewayBaseUrl: localGatewayBaseUrl,
+      backupDir: paths.backupDir,
+      existingClientConfigs: existingState?.client_configs,
     });
 
     await startGateway({
@@ -838,6 +937,7 @@ async function applyInstallForCurrentProvider({
       gateway_pid_path: paths.pidPath,
       latest_backup_path: backupPath,
       state_root: paths.stateRoot,
+      ...(clientConfigInstall.state ? { client_configs: clientConfigInstall.state } : {}),
     };
     await writeJsonFile(paths.statePath, state);
 
@@ -849,20 +949,316 @@ async function applyInstallForCurrentProvider({
       backupPath,
     };
   } catch (error) {
-    await writeUtf8File(codexConfigPath, previousConfigContent);
-    await stopGateway({ stateRoot, quiet: true });
+    const rollbackErrors = [];
+    if (clientConfigInstall?.newRecords?.length > 0) {
+      try {
+        const clientRestore = await restoreClientConfigs({
+          records: clientConfigInstall.newRecords,
+          gatewayBaseUrl: localGatewayBaseUrl,
+        });
+        if (clientRestore.conflicts.length > 0) {
+          rollbackErrors.push(new Error("Client config rollback reported conflicts."));
+        }
+      } catch (rollbackError) {
+        rollbackErrors.push(rollbackError);
+      }
+    }
+    try {
+      await writeUtf8File(codexConfigPath, previousConfigContent);
+    } catch (rollbackError) {
+      rollbackErrors.push(rollbackError);
+    }
+    try {
+      if (gatewayConfigWritten) {
+        if (previousGatewayConfigContent === null) {
+          await rm(paths.configPath, { force: true });
+        } else {
+          await writeUtf8File(paths.configPath, previousGatewayConfigContent);
+        }
+      }
+    } catch (rollbackError) {
+      rollbackErrors.push(rollbackError);
+    }
+    try {
+      await stopGateway({ stateRoot, quiet: true });
+    } catch (rollbackError) {
+      rollbackErrors.push(rollbackError);
+    }
+    if (rollbackErrors.length > 0) {
+      throw new AggregateError([error, ...rollbackErrors], "Gateway install failed and rollback was incomplete.");
+    }
     throw error;
   }
 }
 
+async function applyInstallForClientConfigs({
+  clientConfigPaths = getDefaultClientConfigPaths(),
+  stateRoot = DEFAULT_STATE_ROOT,
+  listenHost = DEFAULT_LISTEN_HOST,
+  listenPort = DEFAULT_LISTEN_PORT,
+}) {
+  const paths = getGatewayStatePaths(stateRoot);
+  await ensureDirectory(paths.stateRoot);
+  await ensureDirectory(paths.configDir);
+  await ensureDirectory(paths.logDir);
+  await ensureDirectory(paths.backupDir);
+
+  const source = await findCompatibleClientUpstream({ clientConfigPaths });
+  if (!source.upstreamBaseUrl) {
+    throw new Error("No compatible pi, OpenCode, or ZCode provider with a usable upstream URL was found.");
+  }
+
+  const localGatewayBaseUrl = getGatewayBaseUrl(listenHost, listenPort);
+  const existingState = await readJsonFile(paths.statePath);
+  const existingGatewayConfig = await readJsonFile(paths.configPath);
+  const gatewayConfig = buildGatewayInstallConfig({
+    existingGatewayConfig,
+    listenHost,
+    listenPort,
+    upstreamBaseUrl: source.upstreamBaseUrl,
+  });
+  const previousGatewayConfigContent = fs.existsSync(paths.configPath)
+    ? await readFile(paths.configPath, "utf8")
+    : null;
+  const previousStateContent = fs.existsSync(paths.statePath)
+    ? await readFile(paths.statePath, "utf8")
+    : null;
+  let clientConfigInstall = null;
+
+  try {
+    await writeJsonFile(paths.configPath, gatewayConfig);
+    clientConfigInstall = await installManagedClientConfigs({
+      clientConfigPaths,
+      upstreamBaseUrl: source.upstreamBaseUrl,
+      gatewayBaseUrl: localGatewayBaseUrl,
+      backupDir: paths.backupDir,
+      existingClientConfigs: existingState?.client_configs,
+    });
+    if (clientConfigInstall.state.records.length === 0) {
+      throw new Error("No compatible client configuration could be redirected to the local gateway.");
+    }
+    await startGateway({
+      stateRoot,
+      configPath: paths.configPath,
+      logPath: paths.logPath,
+      restartIfRunning: true,
+    });
+
+    const installedAt = new Date().toISOString();
+    await writeJsonFile(paths.statePath, {
+      installed_at: installedAt,
+      last_started_at: installedAt,
+      original_base_url: source.upstreamBaseUrl,
+      gateway_base_url: localGatewayBaseUrl,
+      gateway_config_path: paths.configPath,
+      gateway_log_path: paths.logPath,
+      gateway_pid_path: paths.pidPath,
+      state_root: paths.stateRoot,
+      client_source: {
+        client: source.client,
+        provider_id: source.providerId,
+        file_path: source.filePath,
+      },
+      client_configs: clientConfigInstall.state,
+    });
+    return {
+      provider: `${source.client}:${source.providerId}`,
+      upstream: source.upstreamBaseUrl,
+      gateway: localGatewayBaseUrl,
+      configPath: paths.configPath,
+      backupPath: "",
+    };
+  } catch (error) {
+    const rollbackErrors = [];
+    try {
+      await stopGateway({ stateRoot, quiet: true });
+    } catch (rollbackError) {
+      rollbackErrors.push(rollbackError);
+    }
+    if (clientConfigInstall?.newRecords?.length > 0) {
+      try {
+        const clientRestore = await restoreClientConfigs({
+          records: clientConfigInstall.newRecords,
+          gatewayBaseUrl: localGatewayBaseUrl,
+        });
+        if (clientRestore.conflicts.length > 0) {
+          rollbackErrors.push(new Error("Client config rollback reported conflicts."));
+        }
+      } catch (rollbackError) {
+        rollbackErrors.push(rollbackError);
+      }
+    }
+    try {
+      if (previousGatewayConfigContent === null) {
+        await rm(paths.configPath, { force: true });
+      } else {
+        await writeUtf8File(paths.configPath, previousGatewayConfigContent);
+      }
+    } catch (rollbackError) {
+      rollbackErrors.push(rollbackError);
+    }
+    try {
+      if (previousStateContent === null) {
+        await rm(paths.statePath, { force: true });
+      } else {
+        await writeUtf8File(paths.statePath, previousStateContent);
+      }
+    } catch (rollbackError) {
+      rollbackErrors.push(rollbackError);
+    }
+    if (rollbackErrors.length > 0) {
+      throw new AggregateError([error, ...rollbackErrors], "Client-only gateway install failed and rollback was incomplete.");
+    }
+    throw error;
+  }
+}
+
+async function launchUiForClientConfigs({
+  clientConfigPaths = getDefaultClientConfigPaths(),
+  stateRoot = DEFAULT_STATE_ROOT,
+  listenHost = DEFAULT_LISTEN_HOST,
+  listenPort = DEFAULT_LISTEN_PORT,
+}) {
+  const paths = getGatewayStatePaths(stateRoot);
+  const requestedGatewayBaseUrl = getGatewayBaseUrl(listenHost, listenPort);
+  const existingState = await readJsonFile(paths.statePath);
+  let existingGatewayConfig = await readJsonFile(paths.configPath);
+  const previousGatewayConfigContent = fs.existsSync(paths.configPath)
+    ? await readFile(paths.configPath, "utf8")
+    : null;
+  let recoveredGatewayConfigWritten = false;
+  const existingRecords = Array.isArray(existingState?.client_configs?.records)
+    ? existingState.client_configs.records
+    : [];
+
+  if (existingState?.codex_config_path) {
+    throw new Error(`Codex config file was not found: ${existingState.codex_config_path}`);
+  }
+  if (
+    !existingGatewayConfig &&
+    existingState?.original_base_url &&
+    existingRecords.length > 0
+  ) {
+    const gatewayProcessId = await readLiveGatewayPid(paths.pidPath);
+    existingGatewayConfig = await readGatewayRuntimeConfig(
+      existingState.gateway_base_url,
+      gatewayProcessId,
+    );
+    if (!existingGatewayConfig) {
+      throw new Error("Client-only install state exists, but the gateway runtime configuration could not be verified.");
+    }
+  }
+  if (
+    existingGatewayConfig &&
+    existingState?.original_base_url &&
+    existingRecords.length > 0
+  ) {
+    const existingGatewayBaseUrl = getGatewayBaseUrlFromConfig(existingGatewayConfig);
+    if (existingGatewayBaseUrl !== requestedGatewayBaseUrl) {
+      throw new Error("Changing the gateway listen address for a client-only install requires restore before reinstall.");
+    }
+    const previousState = existingState;
+    let clientConfigInstall = null;
+    const gatewayProcessId = await readLiveGatewayPid(paths.pidPath);
+    const gatewayHealthy =
+      gatewayProcessId !== null &&
+      await isGatewayHealthy(existingGatewayConfig, gatewayProcessId);
+    try {
+      if (previousGatewayConfigContent === null) {
+        await writeJsonFile(paths.configPath, existingGatewayConfig);
+        recoveredGatewayConfigWritten = true;
+      }
+      clientConfigInstall = await installManagedClientConfigs({
+        clientConfigPaths,
+        upstreamBaseUrl: existingState.original_base_url,
+        gatewayBaseUrl: requestedGatewayBaseUrl,
+        backupDir: paths.backupDir,
+        existingClientConfigs: existingState.client_configs,
+      });
+      if (!gatewayHealthy) {
+        await startGateway({
+          stateRoot,
+          configPath: paths.configPath,
+          logPath: paths.logPath,
+          restartIfRunning: false,
+        });
+      }
+      const nextState = {
+        ...existingState,
+        last_started_at: gatewayHealthy
+          ? existingState.last_started_at
+          : new Date().toISOString(),
+        ...(clientConfigInstall.state ? { client_configs: clientConfigInstall.state } : {}),
+      };
+      if (!jsonValuesEqual(previousState, nextState)) {
+        await writeJsonFile(paths.statePath, nextState);
+      }
+    } catch (error) {
+      const rollbackErrors = [];
+      if (!gatewayHealthy) {
+        try {
+          await stopGateway({ stateRoot, quiet: true });
+        } catch (rollbackError) {
+          rollbackErrors.push(rollbackError);
+        }
+      }
+      if (clientConfigInstall?.newRecords?.length > 0) {
+        try {
+          const clientRestore = await restoreClientConfigs({
+            records: clientConfigInstall.newRecords,
+            gatewayBaseUrl: requestedGatewayBaseUrl,
+          });
+          if (clientRestore.conflicts.length > 0) {
+            rollbackErrors.push(new Error("Client config rollback reported conflicts."));
+          }
+        } catch (rollbackError) {
+          rollbackErrors.push(rollbackError);
+        }
+      }
+      if (recoveredGatewayConfigWritten) {
+        try {
+          if (previousGatewayConfigContent === null) {
+            await rm(paths.configPath, { force: true });
+          } else {
+            await writeUtf8File(paths.configPath, previousGatewayConfigContent);
+          }
+        } catch (rollbackError) {
+          rollbackErrors.push(rollbackError);
+        }
+      }
+      if (rollbackErrors.length > 0) {
+        throw new AggregateError([error, ...rollbackErrors], "Client-only reuse failed and rollback was incomplete.");
+      }
+      throw error;
+    }
+    return {
+      mode: "reuse",
+      gatewayBaseUrl: requestedGatewayBaseUrl,
+    };
+  }
+
+  const installed = await applyInstallForClientConfigs({
+    clientConfigPaths,
+    stateRoot,
+    listenHost,
+    listenPort,
+  });
+  return {
+    mode: "install",
+    gatewayBaseUrl: installed.gateway,
+  };
+}
+
 export async function installForCurrentProvider({
   codexConfigPath = DEFAULT_CODEX_CONFIG_PATH,
+  clientConfigPaths = getDefaultClientConfigPaths(),
   stateRoot = DEFAULT_STATE_ROOT,
   listenHost = DEFAULT_LISTEN_HOST,
   listenPort = DEFAULT_LISTEN_PORT,
 }) {
   const launchResult = await launchUi({
     codexConfigPath,
+    clientConfigPaths,
     stateRoot,
     listenHost,
     listenPort,
@@ -871,9 +1267,11 @@ export async function installForCurrentProvider({
   const paths = getGatewayStatePaths(stateRoot);
   const state = await readJsonFile(paths.statePath);
   const gatewayConfig = await readJsonFile(paths.configPath);
-  const providerContext = await getCodexProviderContext(codexConfigPath);
+  const providerContext = fs.existsSync(codexConfigPath)
+    ? await getCodexProviderContext(codexConfigPath)
+    : null;
   return {
-    provider: state?.provider_name || providerContext.providerName,
+    provider: state?.provider_name || state?.client_source?.client || providerContext?.providerName || "client",
     upstream: state?.original_base_url || gatewayConfig?.upstream_base_url || "",
     gateway: getGatewayBaseUrlFromConfig(gatewayConfig) || launchResult.gatewayBaseUrl,
     configPath: paths.configPath,
@@ -892,23 +1290,67 @@ export async function restoreCodexConfig({
     throw new Error(`Install state file was not found: ${paths.statePath}`);
   }
 
+  const clientRecords = Array.isArray(state?.client_configs?.records)
+    ? state.client_configs.records
+    : [];
+  const managedCodexConfigPath = state.codex_config_path || null;
   const backupPath = `${state.latest_backup_path || ""}`;
-  if (!isFilePath(backupPath)) {
+  if (managedCodexConfigPath && !isFilePath(backupPath)) {
     throw new Error(`A restorable backup file was not found: ${backupPath}`);
+  }
+  if (managedCodexConfigPath && !isRestorableTargetPath(managedCodexConfigPath)) {
+    throw new Error(`The Codex config path is not a regular file: ${managedCodexConfigPath}`);
+  }
+  if (!managedCodexConfigPath && clientRecords.length === 0) {
+    throw new Error("The install state has no restorable client configuration.");
+  }
+
+  const clientRestorePreview = await restoreClientConfigs({
+    records: clientRecords,
+    gatewayBaseUrl: state.gateway_base_url,
+    dryRun: true,
+  });
+  if (clientRestorePreview.conflicts.length > 0) {
+    throw new Error(`Client configuration restore conflicts: ${clientRestorePreview.conflicts.length}`);
   }
 
   await stopGateway({ stateRoot, quiet: true });
-  await copyFile(backupPath, codexConfigPath);
+  const clientRestore = await restoreClientConfigs({
+    records: clientRecords,
+    gatewayBaseUrl: state.gateway_base_url,
+  });
+  if (clientRestore.conflicts.length > 0) {
+    throw new Error(`Client configuration restore conflicts: ${clientRestore.conflicts.length}`);
+  }
+  try {
+    if (managedCodexConfigPath) {
+      await copyFile(backupPath, managedCodexConfigPath || codexConfigPath);
+    }
+  } catch (error) {
+    if (clientRestore.restored.length > 0) {
+      try {
+        await restoreClientConfigs({
+          records: buildClientRestoreRollbackRecords(clientRestore.restored),
+          gatewayBaseUrl: state.original_base_url,
+        });
+      } catch (rollbackError) {
+        throw new AggregateError([error, rollbackError], "Codex restore failed and client config rollback was incomplete.");
+      }
+    }
+    throw error;
+  }
   await rm(paths.statePath, { force: true });
 
   return {
-    configPath: codexConfigPath,
-    restoredFrom: backupPath,
+    configPath: managedCodexConfigPath || codexConfigPath,
+    restoredFrom: managedCodexConfigPath ? backupPath : "",
+    restoredClients: clientRestore.restored,
   };
 }
 
 export async function launchUi({
   codexConfigPath = DEFAULT_CODEX_CONFIG_PATH,
+  clientConfigPaths = getDefaultClientConfigPaths(),
   stateRoot = DEFAULT_STATE_ROOT,
   listenHost = DEFAULT_LISTEN_HOST,
   listenPort = DEFAULT_LISTEN_PORT,
@@ -921,7 +1363,20 @@ export async function launchUi({
   await ensureDirectory(paths.backupDir);
 
   if (!fs.existsSync(codexConfigPath)) {
-    throw new Error(`Codex config file was not found: ${codexConfigPath}`);
+    const clientLaunch = await launchUiForClientConfigs({
+      clientConfigPaths,
+      stateRoot,
+      listenHost,
+      listenPort,
+    });
+    const uiUrl = `${clientLaunch.gatewayBaseUrl}/__codex_retry_gateway/ui`;
+    if (!noOpen) {
+      openUrl(uiUrl);
+    }
+    return {
+      ...clientLaunch,
+      uiUrl,
+    };
   }
 
   const providerContext = await getCodexProviderContext(codexConfigPath);
@@ -955,6 +1410,7 @@ export async function launchUi({
   if (!canReuseExistingInstall) {
     await applyInstallForCurrentProvider({
       codexConfigPath,
+      clientConfigPaths,
       stateRoot,
       listenHost,
       listenPort,
@@ -976,6 +1432,7 @@ export async function launchUi({
     let previousGatewayHealthy = false;
     let recoveryBackupPath = existingState?.latest_backup_path ? `${existingState.latest_backup_path}` : "";
     let recoveryBackupCreated = false;
+    let clientConfigInstall = null;
 
     try {
       const reusableGatewayConfig = cloneJsonValue(existingGatewayConfig);
@@ -1096,6 +1553,14 @@ export async function launchUi({
         providerConfigWritten = true;
       }
 
+      clientConfigInstall = await installManagedClientConfigs({
+        clientConfigPaths,
+        upstreamBaseUrl: originalBaseUrl,
+        gatewayBaseUrl: requestedGatewayBaseUrl,
+        backupDir: paths.backupDir,
+        existingClientConfigs: existingState?.client_configs,
+      });
+
       const gatewayLifecycleChanged = !previousGatewayHealthy || gatewayConfigChanged;
       if (gatewayLifecycleChanged) {
         gatewayLifecycleAttempted = true;
@@ -1121,6 +1586,7 @@ export async function launchUi({
         gateway_pid_path: paths.pidPath,
         latest_backup_path: recoveryBackupPath,
         state_root: paths.stateRoot,
+        ...(clientConfigInstall.state ? { client_configs: clientConfigInstall.state } : {}),
       };
       if (!jsonValuesEqual(existingState, statePayload)) {
         await writeJsonFile(paths.statePath, statePayload);
@@ -1132,6 +1598,20 @@ export async function launchUi({
       if (gatewayLifecycleAttempted) {
         try {
           await stopGateway({ stateRoot, quiet: true });
+        } catch (rollbackError) {
+          rollbackErrors.push(rollbackError);
+        }
+      }
+
+      if (clientConfigInstall?.newRecords?.length > 0) {
+        try {
+          const clientRestore = await restoreClientConfigs({
+            records: clientConfigInstall.newRecords,
+            gatewayBaseUrl: requestedGatewayBaseUrl,
+          });
+          if (clientRestore.conflicts.length > 0) {
+            rollbackErrors.push(new Error("Client config rollback reported conflicts."));
+          }
         } catch (rollbackError) {
           rollbackErrors.push(rollbackError);
         }

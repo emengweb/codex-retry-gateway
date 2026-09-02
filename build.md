@@ -28,8 +28,9 @@ bash ./scripts/launch-ui.sh
 
 说明：
 
-- 第一次运行会自动安装并接管当前 Codex provider
+- 第一次运行会自动安装并接管当前 Codex provider；如果 Codex 配置不存在，则从 pi、OpenCode、ZCode 中发现兼容 provider 并启动 client-only gateway
 - 再次运行会先核对 provider、配置、PID 与 health：无变化且健康时零写入、零重启；停止时拉起；配置迁移时才重启
+- client-only 运行会在复用启动时发现并接管新出现的兼容 provider，恢复时只还原仍指向 gateway 的字段
 - provider 漂移时只恢复 gateway 接管；恢复备份缺失且当前 provider 指向真实上游时，会先保存该真实配置；切换 provider 时不会复用另一 provider 的备份
 - PID 必须与 health 返回的 `process_id` 一致才允许停止；陈旧 PID 不会终止无关存活进程
 - 手工 install 与 launch 共用恢复控制面；直接 start 也先验证 PID；新进程 health 必须回报自己的 `process_id`
@@ -78,6 +79,28 @@ macOS / Linux:
 ```bash
 bash ./scripts/restore-codex-config.sh
 ```
+
+## Make 生命周期命令
+
+如果本机安装了 GNU Make，可以直接使用统一的停止/恢复入口：
+
+```bash
+make stop
+make stop-only
+make restore
+```
+
+`make stop` 会执行完整的安全关闭：先校验恢复条件，停止 gateway，再恢复 Codex、pi、OpenCode、ZCode 中仍受管理的配置字段并删除安装状态。`make stop-only` 只停止并清理 PID 文件，不恢复配置、不删除安装状态。`make restore` 是 `make stop` 的显式长名称别名。恢复操作仍保留外部改写冲突保护，不会覆盖用户的新配置。
+
+自定义运行目录或 Codex 配置路径时：
+
+```bash
+make stop STATE_ROOT="D:/codex retry gateway"
+make stop-only STATE_ROOT="D:/codex retry gateway"
+make restore STATE_ROOT="D:/codex retry gateway" CODEX_CONFIG_PATH="D:/codex/config.toml"
+```
+
+Windows 也可以使用 `make`、`mingw32-make` 或对应的 GNU Make 命令；参数通过 `STATE_ROOT`、`CODEX_CONFIG_PATH` 和 `ARGS` 传递。
 
 ## 打开管理页面
 
@@ -181,6 +204,9 @@ node .\scripts\test-gateway-e2e.mjs
 node .\scripts\test-content-encoding.mjs
 node .\scripts\test-memory-guard.mjs
 node .\scripts\test-install-restore.mjs
+node .\scripts\test-client-configs.mjs
+node .\scripts\test-client-only-install.mjs
+node .\scripts\test-makefile.mjs
 node .\scripts\test-launch-ui.mjs
 node .\scripts\test-launch-ui-unix.mjs
 node --check .\gateway.mjs
@@ -191,6 +217,7 @@ node --check .\scripts\test-gateway-e2e.mjs
 node --check .\scripts\test-install-restore.mjs
 node --check .\scripts\test-launch-ui.mjs
 node --check .\scripts\test-launch-ui-unix.mjs
+node --check .\scripts\test-makefile.mjs
 git diff --check
 ```
 

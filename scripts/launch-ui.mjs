@@ -8,11 +8,27 @@ import {
   launchUi,
   parseOptions,
 } from "./admin-lib.mjs";
+import { getDefaultClientConfigPaths } from "./client-configs.mjs";
+
+function resolveClientConfigPaths(options) {
+  const paths = getDefaultClientConfigPaths();
+  if (options.piConfigPath) {
+    paths.pi = options.piConfigPath;
+  }
+  if (options.opencodeConfigPath) {
+    paths.opencode = options.opencodeConfigPath;
+  }
+  if (options.zcodeConfigPath) {
+    paths.zcode = options.zcodeConfigPath;
+  }
+  return paths;
+}
 
 async function main() {
   const options = parseOptions(process.argv, { booleanFlags: ["no-open"] });
   const result = await launchUi({
     codexConfigPath: options.codexConfigPath || DEFAULT_CODEX_CONFIG_PATH,
+    clientConfigPaths: resolveClientConfigPaths(options),
     stateRoot: options.stateRoot || DEFAULT_STATE_ROOT,
     listenHost: options.listenHost || DEFAULT_LISTEN_HOST,
     listenPort: options.listenPort ? Number.parseInt(`${options.listenPort}`, 10) : DEFAULT_LISTEN_PORT,

@@ -9,6 +9,7 @@ import path from "node:path";
 import { TextDecoder } from "node:util";
 import { fileURLToPath } from "node:url";
 import * as zlib from "node:zlib";
+import { restoreClientConfigs } from "./scripts/client-configs.mjs";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -6856,22 +6857,85 @@ async function readRuntimeState(runtime) {
   };
 }
 
+function isRegularFilePath(filePath) {
+  if (!filePath || !fs.existsSync(filePath)) {
+    return false;
+  }
+  const fileStats = fs.lstatSync(filePath);
+  return fileStats.isFile() && !fileStats.isSymbolicLink();
+}
+
+function isRestorableTargetPath(filePath) {
+  if (!filePath) {
+    return true;
+  }
+  try {
+    const fileStats = fs.lstatSync(filePath);
+    return fileStats.isFile() && !fileStats.isSymbolicLink();
+  } catch (error) {
+    return error?.code === "ENOENT";
+  }
+}
+
 async function restoreRuntimeState(runtime, state) {
   const backupPath = state?.latest_backup_path;
   const codexConfigPath = state?.codex_config_path;
+  const clientRecords = Array.isArray(state?.client_configs?.records)
+    ? state.client_configs.records
+    : [];
 
-  if (!backupPath || !fs.existsSync(backupPath) || !fs.statSync(backupPath).isFile()) {
+  if (codexConfigPath && !isRegularFilePath(backupPath)) {
     throw new Error(`未找到可恢复备份: ${backupPath || "unknown"}`);
   }
-  if (!codexConfigPath) {
-    throw new Error("安装状态里缺少 codex_config_path");
+  if (codexConfigPath && !isRestorableTargetPath(codexConfigPath)) {
+    throw new Error(`Codex 配置路径不是普通文件: ${codexConfigPath}`);
+  }
+  if (!codexConfigPath && clientRecords.length === 0) {
+    throw new Error("安装状态里没有可恢复的客户端配置");
   }
 
-  await copyFile(backupPath, codexConfigPath);
+  const clientRestorePreview = await restoreClientConfigs({
+    records: clientRecords,
+    gatewayBaseUrl: state?.gateway_base_url,
+    dryRun: true,
+  });
+  if (clientRestorePreview.conflicts.length > 0) {
+    throw new Error(`客户端配置恢复冲突: ${clientRestorePreview.conflicts.length}`);
+  }
+
+  const clientRestore = await restoreClientConfigs({
+    records: clientRecords,
+    gatewayBaseUrl: state?.gateway_base_url,
+  });
+  if (clientRestore.conflicts.length > 0) {
+    throw new Error(`客户端配置恢复冲突: ${clientRestore.conflicts.length}`);
+  }
+  try {
+    if (codexConfigPath) {
+      await copyFile(backupPath, codexConfigPath);
+    }
+  } catch (error) {
+    if (clientRestore.restored.length > 0) {
+      try {
+        await restoreClientConfigs({
+          records: clientRestore.restored.map((record) => ({
+            ...record,
+            originalBaseUrl: record.gatewayBaseUrl,
+            gatewayBaseUrl: record.originalBaseUrl,
+          })),
+          gatewayBaseUrl: state?.original_base_url,
+        });
+      } catch (rollbackError) {
+        throw new AggregateError([error, rollbackError], "Codex restore failed and client config rollback was incomplete.");
+      }
+    }
+    throw error;
+  }
   await Promise.all([
     rm(runtime.paths.statePath, { force: true }),
     rm(runtime.paths.pidPath, { force: true }),
   ]);
+  return clientRestore;
 }
 
 function jsonResponse(res, statusCode, payload, headers = {}) {
@@ -10934,8 +10998,15 @@ function buildManagementHtml() {
 </html>`;
 }
 
-async function handleManagementRequest(runtime, req, res, requestUrl) {
-  const pathname = normalizePath(requestUrl.pathname);
+function isLoopbackAddress(address) {
+  if (!address) {
+    return false;
+  }
+  const normalized = `${address}`.replace(/^::ffff:/, "");
+  return normalized === "127.0.0.1" || normalized === "::1";
+}
+
+async function handleManagementRequest(runtime, req, res, requestUrl) {  const pathname = normalizePath(requestUrl.pathname);
 
   if (pathname === FAVICON_PATH) {
     res.writeHead(204);
@@ -11387,6 +11458,15 @@ async function handleManagementRequest(runtime, req, res, requestUrl) {
   }
 
   if (pathname === RESTORE_API_PATH && req.method === "POST") {
+    if (!isLoopbackAddress(req.socket?.remoteAddress)) {
+      jsonResponse(res, 403, {
+        error: {
+          message: "恢复接口只允许本机访问",
+          code: "loopback_required",
+        },
+      });
+      return true;
+    }
     const state = await readRuntimeState(runtime);
     if (!state) {
       jsonResponse(res, 409, {
