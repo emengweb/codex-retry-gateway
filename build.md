@@ -80,6 +80,26 @@ macOS / Linux:
 bash ./scripts/restore-codex-config.sh
 ```
 
+## Make 生命周期命令
+
+如果本机安装了 GNU Make，可以直接使用统一的停止/恢复入口：
+
+```bash
+make stop
+make restore
+```
+
+`make stop` 只停止并清理受管 gateway 的 PID 文件，不修改 Codex、pi、OpenCode 或 ZCode 配置；`make restore` 会先校验恢复条件，停止 gateway，再恢复仍指向 gateway 的配置字段并删除安装状态。恢复遇到外部改写时会失败并保留状态，避免覆盖用户修改。
+
+自定义运行目录或 Codex 配置路径时：
+
+```bash
+make stop STATE_ROOT="D:/codex retry gateway"
+make restore STATE_ROOT="D:/codex retry gateway" CODEX_CONFIG_PATH="D:/codex/config.toml"
+```
+
+Windows 也可以使用 `make`、`mingw32-make` 或对应的 GNU Make 命令；参数通过 `STATE_ROOT`、`CODEX_CONFIG_PATH` 和 `ARGS` 传递。
+
 ## 打开管理页面
 
 ```text
@@ -184,6 +204,7 @@ node .\scripts\test-memory-guard.mjs
 node .\scripts\test-install-restore.mjs
 node .\scripts\test-client-configs.mjs
 node .\scripts\test-client-only-install.mjs
+node .\scripts\test-makefile.mjs
 node .\scripts\test-launch-ui.mjs
 node .\scripts\test-launch-ui-unix.mjs
 node --check .\gateway.mjs
@@ -194,6 +215,7 @@ node --check .\scripts\test-gateway-e2e.mjs
 node --check .\scripts\test-install-restore.mjs
 node --check .\scripts\test-launch-ui.mjs
 node --check .\scripts\test-launch-ui-unix.mjs
+node --check .\scripts\test-makefile.mjs
 git diff --check
 ```
 

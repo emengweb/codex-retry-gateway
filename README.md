@@ -202,6 +202,26 @@ bash ./scripts/restore-codex-config.sh
 - 删除当前安装状态文件
 - 如果 state 没有指向真实存在的备份文件，脚本会明确失败；不会用已经指向 gateway 的配置伪造恢复点
 
+## Make 生命周期命令
+
+如果本机安装了 GNU Make，可以直接使用：
+
+```bash
+make stop
+make restore
+```
+
+`make stop` 只停止 gateway，不恢复客户端配置；`make restore` 才会停止 gateway 并恢复 Codex、pi、OpenCode、ZCode 中仍受管理的配置字段。恢复操作仍保留外部改写冲突保护，不会覆盖用户的新配置。
+
+自定义路径示例：
+
+```bash
+make stop STATE_ROOT="D:/codex retry gateway"
+make restore STATE_ROOT="D:/codex retry gateway" CODEX_CONFIG_PATH="D:/codex/config.toml"
+```
+
+Windows 可使用 `make` 或 `mingw32-make`；底层仍复用 Node 生命周期核心。
+
 ## 管理页面
 
 页面入口：
