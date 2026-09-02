@@ -11,7 +11,7 @@ const projectRoot = path.resolve(import.meta.dirname, "..");
 const makefilePath = path.join(projectRoot, "Makefile");
 
 assert(fs.existsSync(makefilePath), "Makefile must define lifecycle targets");
-const makefile = await readFile(makefilePath, "utf8");
+const makefile = (await readFile(makefilePath, "utf8")).replace(/\r\n/g, "\n");
 assert.match(makefile, /^\.PHONY:.*\bhelp\b.*\bstop\b.*\bstop-only\b.*\brestore\b/m, "Makefile must declare lifecycle targets");
 assert.match(makefile, /^stop:\s*\n(?:\t.*\n)+/m, "stop target must invoke restore");
 assert.match(makefile, /^stop-only:\s*\n(?:\t.*\n)+/m, "stop-only target must invoke stop script");
