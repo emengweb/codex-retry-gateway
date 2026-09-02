@@ -28,8 +28,9 @@ bash ./scripts/launch-ui.sh
 
 说明：
 
-- 第一次运行会自动安装并接管当前 Codex provider
+- 第一次运行会自动安装并接管当前 Codex provider；如果 Codex 配置不存在，则从 pi、OpenCode、ZCode 中发现兼容 provider 并启动 client-only gateway
 - 再次运行会先核对 provider、配置、PID 与 health：无变化且健康时零写入、零重启；停止时拉起；配置迁移时才重启
+- client-only 运行会在复用启动时发现并接管新出现的兼容 provider，恢复时只还原仍指向 gateway 的字段
 - provider 漂移时只恢复 gateway 接管；恢复备份缺失且当前 provider 指向真实上游时，会先保存该真实配置；切换 provider 时不会复用另一 provider 的备份
 - PID 必须与 health 返回的 `process_id` 一致才允许停止；陈旧 PID 不会终止无关存活进程
 - 手工 install 与 launch 共用恢复控制面；直接 start 也先验证 PID；新进程 health 必须回报自己的 `process_id`
@@ -181,6 +182,8 @@ node .\scripts\test-gateway-e2e.mjs
 node .\scripts\test-content-encoding.mjs
 node .\scripts\test-memory-guard.mjs
 node .\scripts\test-install-restore.mjs
+node .\scripts\test-client-configs.mjs
+node .\scripts\test-client-only-install.mjs
 node .\scripts\test-launch-ui.mjs
 node .\scripts\test-launch-ui-unix.mjs
 node --check .\gateway.mjs

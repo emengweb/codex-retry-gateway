@@ -47,12 +47,26 @@ TG群：[https://t.me/AI_INPUT_IM](https://t.me/AI_INPUT_IM)
 Windows:
 
 - Codex 配置：`%USERPROFILE%\.codex\config.toml`
+- pi 配置：`%USERPROFILE%\.pi\agent\models.json`
+- OpenCode 配置：`%USERPROFILE%\.config\opencode\opencode.jsonc` 或 `opencode.json`
+- ZCode 配置：`%USERPROFILE%\.zcode\v2\config.json`
 - Gateway 状态目录：`%USERPROFILE%\.codex-retry-gateway`
 
 macOS / Linux:
 
 - Codex 配置：`~/.codex/config.toml`
+- pi 配置：`~/.pi/agent/models.json`
+- OpenCode 配置：`~/.config/opencode/opencode.jsonc` 或 `opencode.json`
+- ZCode 配置：`~/.zcode/v2/config.json`
 - Gateway 状态目录：`~/.codex-retry-gateway`
+
+自动接管范围：
+
+- 仅改写 pi、OpenCode、ZCode 中标记为 OpenAI-compatible 的 provider。
+- 只有与当前 gateway upstream 完全一致的 URL 才会接管；其它协议或不同 upstream 会跳过并写入状态报告。
+- 配置改写按字段执行，保留 OpenCode JSONC 注释和用户无关内容；每个改写文件都会在 gateway 状态目录的 `backups` 下保存快照。
+- 恢复只改回仍指向本次 gateway 的字段；发现用户外部改写时报告冲突，不覆盖新值。
+- Codex 配置不存在时，只要发现可用的兼容客户端配置，仍可启动 client-only gateway。
 
 ## 当前版本说明
 
@@ -120,16 +134,28 @@ bash ./scripts/launch-ui.sh --no-open
 
 - Windows 参数：
   - `-CodexConfigPath`
+  - `-PiConfigPath`
+  - `-OpenCodeConfigPath`
+  - `-ZcodeConfigPath`
   - `-StateRoot`
   - `-ListenHost`
   - `-ListenPort`
   - `-NoOpen`
 - macOS / Linux 参数：
   - `--codex-config-path`
+  - `--pi-config-path`
+  - `--opencode-config-path`
+  - `--zcode-config-path`
   - `--state-root`
   - `--listen-host`
   - `--listen-port`
   - `--no-open`
+
+client-only 场景：
+
+- 当 Codex 配置不存在时，启动入口会按 pi、OpenCode、ZCode 的默认路径自动发现兼容 provider。
+- 也可以通过上面的客户端路径参数指定临时或非默认配置文件。
+- 恢复入口会停止 gateway，恢复所有仍受管理的客户端字段，并清理安装状态；外部改写会作为冲突返回且不会被覆盖。
 
 macOS / Linux 说明：
 
@@ -530,7 +556,7 @@ macOS / Linux: ~/.codex-retry-gateway
 ## 已验证事项
 
 - 本地 CI 为默认验收入口
-  - 优先在本机运行 `test-gateway-e2e.ps1` / `test-install-restore.ps1` / `test-launch-ui.ps1` / `test-launch-ui-unix.ps1`
+  - 优先在本机运行 `test-gateway-e2e.ps1` / `test-install-restore.ps1` / `test-client-configs.mjs` / `test-client-only-install.mjs` / `test-launch-ui.ps1` / `test-launch-ui-unix.ps1`
   - GitHub Actions `macos-smoke` 已在仓库侧手动禁用，push / PR 不再自动运行
   - 需要补足“本地没有 mac”时的 Unix 入口冒烟时，再按需手动重新启用或触发 `macos-smoke`
 - `test-gateway-e2e.ps1`
@@ -539,6 +565,12 @@ macOS / Linux: ~/.codex-retry-gateway
 - `test-install-restore.ps1`
   - 已通过
   - 验证安装、透传、UI 页面、热更新配置、实时日志、516 统计、恢复闭环
+- `test-client-configs.mjs`
+  - 已通过
+  - 验证 pi、OpenCode、ZCode 配置发现、最小改写、JSONC 注释保留、备份、冲突恢复和 gateway 归属校验
+- `test-client-only-install.mjs`
+  - 已通过
+  - 验证无 Codex 时的 client-only 安装、复用接管新配置、缺失 `config.json` 恢复、管理页恢复和 PowerShell 入口
 - `test-launch-ui.ps1`
   - 已通过
   - 验证首次一键启动自动安装、再次启动自动复用、UI 可访问、默认 `516/1034/1552` 拦截仍生效
