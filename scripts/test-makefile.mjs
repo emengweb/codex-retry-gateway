@@ -12,11 +12,13 @@ const makefilePath = path.join(projectRoot, "Makefile");
 
 assert(fs.existsSync(makefilePath), "Makefile must define lifecycle targets");
 const makefile = await readFile(makefilePath, "utf8");
-assert.match(makefile, /^\.PHONY:.*\bstop\b.*\brestore\b/m, "Makefile must declare stop and restore targets");
-assert.match(makefile, /^stop:\s*\n(?:\t.*\n)+/m, "Makefile must invoke the stop script");
-assert.match(makefile, /^restore:\s*\n(?:\t.*\n)+/m, "Makefile must invoke the restore script");
-assert.match(makefile, /scripts\/stop-gateway\.mjs/, "stop target must call the Node lifecycle entry");
-assert.match(makefile, /scripts\/restore-codex-config\.mjs/, "restore target must call the Node lifecycle entry");
+assert.match(makefile, /^\.PHONY:.*\bhelp\b.*\bstop\b.*\bstop-only\b.*\brestore\b/m, "Makefile must declare lifecycle targets");
+assert.match(makefile, /^stop:\s*\n(?:\t.*\n)+/m, "stop target must invoke restore");
+assert.match(makefile, /^stop-only:\s*\n(?:\t.*\n)+/m, "stop-only target must invoke stop script");
+assert.match(makefile, /^restore:\s*\n(?:\t.*\n)+/m, "restore target must invoke restore script");
+assert.match(makefile, /stop:\s*\n\t.*scripts\/restore-codex-config\.mjs/m, "stop target must restore configuration");
+assert.match(makefile, /stop-only:\s*\n\t.*scripts\/stop-gateway\.mjs/m, "stop-only target must only stop the gateway");
+assert.match(makefile, /restore:\s*\n\t.*scripts\/restore-codex-config\.mjs/m, "restore target must call the restore lifecycle entry");
 
 const makeCommandCandidates = process.platform === "win32"
   ? ["make", "mingw32-make"]
@@ -27,7 +29,7 @@ const makeCommand = makeCommandCandidates.find((candidate) => {
 });
 
 if (makeCommand) {
-  for (const target of ["stop", "restore"]) {
+  for (const target of ["stop", "stop-only", "restore"]) {
     const dryRun = spawnSync(
       makeCommand,
       ["--no-print-directory", "-n", target],
@@ -76,6 +78,33 @@ if (makeCommand) {
       "utf8",
     );
 
+    const help = spawnSync(
+      makeCommand,
+      ["--no-print-directory"],
+      { cwd: projectRoot, encoding: "utf8" },
+    );
+    assert.equal(help.status, 0, `make help failed: ${help.stderr}`);
+    for (const command of ["make stop", "make stop-only", "make restore"]) {
+      assert.match(help.stdout, new RegExp(command.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")), `make help must document ${command}`);
+    }
+
+    const stopOnly = spawnSync(
+      makeCommand,
+      ["--no-print-directory", "stop-only", `STATE_ROOT=${stateRoot}`],
+      { cwd: projectRoot, encoding: "utf8" },
+    );
+    assert.equal(stopOnly.status, 0, `make stop-only failed: ${stopOnly.stderr}`);
+    assert.match(
+      `${stopOnly.stdout}\n${stopOnly.stderr}`,
+      /No running gateway PID file was found\./,
+      "make stop-only must pass STATE_ROOT to the lifecycle script",
+    );
+    assert.equal(
+      fs.existsSync(path.join(stateRoot, "state.json")),
+      true,
+      "make stop-only must not clear install state or restore client config",
+    );
+
     const stop = spawnSync(
       makeCommand,
       ["--no-print-directory", "stop", `STATE_ROOT=${stateRoot}`],
@@ -84,41 +113,19 @@ if (makeCommand) {
     assert.equal(stop.status, 0, `make stop failed: ${stop.stderr}`);
     assert.match(
       `${stop.stdout}\n${stop.stderr}`,
-      /No running gateway PID file was found\./,
-      "make stop must pass STATE_ROOT to the lifecycle script",
-    );
-    assert.equal(
-      fs.existsSync(path.join(stateRoot, "state.json")),
-      true,
-      "make stop must not clear install state or restore client config",
-    );
-
-    const restore = spawnSync(
-      makeCommand,
-      [
-        "--no-print-directory",
-        "restore",
-        `STATE_ROOT=${stateRoot}`,
-        `CODEX_CONFIG_PATH=${codexConfigPath}`,
-      ],
-      { cwd: projectRoot, encoding: "utf8" },
-    );
-    assert.equal(restore.status, 0, `make restore failed: ${restore.stderr}`);
-    assert.match(
-      `${restore.stdout}\n${restore.stderr}`,
       /Restored Codex config/,
-      "make restore must invoke the restore lifecycle entry",
+      "make stop must restore configuration and close the gateway",
     );
     const restoredPi = JSON.parse(await readFile(piConfigPath, "utf8"));
     assert.equal(
       restoredPi.providers.shared.baseUrl,
       upstreamBaseUrl,
-      "make restore must restore the managed client field",
+      "make stop must restore the managed client field",
     );
     assert.equal(
       fs.existsSync(path.join(stateRoot, "state.json")),
       false,
-      "make restore must clear install state",
+      "make stop must clear install state after restore",
     );
   } finally {
     await rm(tempRoot, { recursive: true, force: true });

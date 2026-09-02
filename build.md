@@ -86,15 +86,17 @@ bash ./scripts/restore-codex-config.sh
 
 ```bash
 make stop
+make stop-only
 make restore
 ```
 
-`make stop` 只停止并清理受管 gateway 的 PID 文件，不修改 Codex、pi、OpenCode 或 ZCode 配置；`make restore` 会先校验恢复条件，停止 gateway，再恢复仍指向 gateway 的配置字段并删除安装状态。恢复遇到外部改写时会失败并保留状态，避免覆盖用户修改。
+`make stop` 会执行完整的安全关闭：先校验恢复条件，停止 gateway，再恢复 Codex、pi、OpenCode、ZCode 中仍受管理的配置字段并删除安装状态。`make stop-only` 只停止并清理 PID 文件，不恢复配置、不删除安装状态。`make restore` 是 `make stop` 的显式长名称别名。恢复操作仍保留外部改写冲突保护，不会覆盖用户的新配置。
 
 自定义运行目录或 Codex 配置路径时：
 
 ```bash
 make stop STATE_ROOT="D:/codex retry gateway"
+make stop-only STATE_ROOT="D:/codex retry gateway"
 make restore STATE_ROOT="D:/codex retry gateway" CODEX_CONFIG_PATH="D:/codex/config.toml"
 ```
 
