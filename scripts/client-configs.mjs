@@ -229,7 +229,6 @@ function normalizeUrl(value) {
       return null;
     }
     parsed.hash = "";
-    parsed.search = "";
     parsed.pathname = parsed.pathname.replace(/\/+$/, "") || "/";
     return parsed.href.replace(/\/$/, "");
   } catch {
@@ -254,8 +253,12 @@ function providerSupportsOpenAi(provider) {
     getStringValue(provider, "kind"),
   ]
     .filter(Boolean)
-    .map((value) => value.toLowerCase());
-  return markers.some((value) => value.includes("openai"));
+    .map((value) => value.toLowerCase().trim());
+  return markers.some((value) =>
+    value === "openai-completions" ||
+    value === "openai-chat-completions" ||
+    value.includes("openai-compatible"),
+  );
 }
 
 function createCandidate({ client, filePath, providerId, fieldPath, urlNode, provider }) {
@@ -382,7 +385,7 @@ function buildSkipped(client, filePath, reason, providerId = null) {
 
 function isManagedGatewayRecord(record, gatewayBaseUrl) {
   if (!record.gatewayBaseUrl || !gatewayBaseUrl) {
-    return true;
+    return false;
   }
   return areEquivalentUpstreamUrls(record.gatewayBaseUrl, gatewayBaseUrl);
 }

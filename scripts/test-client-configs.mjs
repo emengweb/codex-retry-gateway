@@ -37,6 +37,10 @@ async function run() {
       "baseUrl": "${upstreamBaseUrl}",
       "api": "anthropic-messages"
     },
+    "native-openai": {
+      "baseUrl": "${upstreamBaseUrl}",
+      "api": "openai-responses"
+    },
     "other": {
       "baseUrl": "https://other.example/v1",
       "api": "openai-completions"
@@ -102,6 +106,19 @@ async function run() {
     });
 
     assert.equal(installed.records.length, 4, "应只接管三个客户端的四个兼容 provider 字段");
+    assert(!installed.records.some((record) => record.providerId === "native-openai"), "原生 OpenAI Responses provider 不应被接管");
+    assert(
+      (await readFile(piPath, "utf8")).includes('"api": "openai-responses"'),
+      "原生 OpenAI Responses provider 配置应保持不变",
+    );
+    assert.equal(
+      (await import("./client-configs.mjs")).areEquivalentUpstreamUrls(
+        `${upstreamBaseUrl}?tenant=a`,
+        `${upstreamBaseUrl}?tenant=b`,
+      ),
+      false,
+      "不同 query 的 upstream 不应被视为同一地址",
+    );
     assert.deepEqual(
       installed.records.map((record) => record.client).sort(),
       ["opencode", "opencode", "pi", "zcode"],
@@ -182,6 +199,15 @@ async function run() {
       mismatchedGatewayRestore.restored.length,
       0,
       "不同 gateway 的恢复记录不得写入客户端配置",
+    );
+    const missingGatewayRestore = await restoreClientConfigs({
+      records: installed.records.map(({ gatewayBaseUrl: _gatewayBaseUrl, ...record }) => record),
+      gatewayBaseUrl,
+    });
+    assert.equal(missingGatewayRestore.restored.length, 0, "缺失 gateway 归属的记录不得恢复");
+    assert(
+      missingGatewayRestore.conflicts.every((entry) => entry.reason === "gateway_mismatch"),
+      "缺失 gateway 归属的记录应统一报告 gateway_mismatch",
     );
     assert(
       mismatchedGatewayRestore.conflicts.every((entry) => entry.reason === "gateway_mismatch"),

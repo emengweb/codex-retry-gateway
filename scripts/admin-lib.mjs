@@ -270,7 +270,8 @@ function isFilePath(filePath) {
     return false;
   }
   try {
-    return fs.statSync(filePath).isFile();
+    const fileStats = fs.lstatSync(filePath);
+    return fileStats.isFile() && !fileStats.isSymbolicLink();
   } catch {
     return false;
   }
@@ -766,6 +767,26 @@ function buildGatewayInstallConfig({
     log_match: existingGatewayConfig?.log_match === undefined ? true : Boolean(existingGatewayConfig.log_match),
     health_path: existingGatewayConfig?.health_path || DEFAULT_HEALTH_PATH,
   };
+}
+
+function isRestorableTargetPath(filePath) {
+  if (!filePath) {
+    return true;
+  }
+  try {
+    const fileStats = fs.lstatSync(filePath);
+    return fileStats.isFile() && !fileStats.isSymbolicLink();
+  } catch (error) {
+    return error?.code === "ENOENT";
+  }
+}
+
+function buildClientRestoreRollbackRecords(records) {
+  return records.map((record) => ({
+    ...record,
+    originalBaseUrl: record.gatewayBaseUrl,
+    gatewayBaseUrl: record.originalBaseUrl,
+  }));
 }
 
 function getClientConfigRecordKey(record) {
@@ -1277,6 +1298,9 @@ export async function restoreCodexConfig({
   if (managedCodexConfigPath && !isFilePath(backupPath)) {
     throw new Error(`A restorable backup file was not found: ${backupPath}`);
   }
+  if (managedCodexConfigPath && !isRestorableTargetPath(managedCodexConfigPath)) {
+    throw new Error(`The Codex config path is not a regular file: ${managedCodexConfigPath}`);
+  }
   if (!managedCodexConfigPath && clientRecords.length === 0) {
     throw new Error("The install state has no restorable client configuration.");
   }
@@ -1291,15 +1315,29 @@ export async function restoreCodexConfig({
   }
 
   await stopGateway({ stateRoot, quiet: true });
-  if (managedCodexConfigPath) {
-    await copyFile(backupPath, managedCodexConfigPath || codexConfigPath);
-  }
   const clientRestore = await restoreClientConfigs({
     records: clientRecords,
     gatewayBaseUrl: state.gateway_base_url,
   });
   if (clientRestore.conflicts.length > 0) {
     throw new Error(`Client configuration restore conflicts: ${clientRestore.conflicts.length}`);
+  }
+  try {
+    if (managedCodexConfigPath) {
+      await copyFile(backupPath, managedCodexConfigPath || codexConfigPath);
+    }
+  } catch (error) {
+    if (clientRestore.restored.length > 0) {
+      try {
+        await restoreClientConfigs({
+          records: buildClientRestoreRollbackRecords(clientRestore.restored),
+          gatewayBaseUrl: state.original_base_url,
+        });
+      } catch (rollbackError) {
+        throw new AggregateError([error, rollbackError], "Codex restore failed and client config rollback was incomplete.");
+      }
+    }
+    throw error;
   }
   await rm(paths.statePath, { force: true });
 

@@ -6857,6 +6857,26 @@ async function readRuntimeState(runtime) {
   };
 }
 
+function isRegularFilePath(filePath) {
+  if (!filePath || !fs.existsSync(filePath)) {
+    return false;
+  }
+  const fileStats = fs.lstatSync(filePath);
+  return fileStats.isFile() && !fileStats.isSymbolicLink();
+}
+
+function isRestorableTargetPath(filePath) {
+  if (!filePath) {
+    return true;
+  }
+  try {
+    const fileStats = fs.lstatSync(filePath);
+    return fileStats.isFile() && !fileStats.isSymbolicLink();
+  } catch (error) {
+    return error?.code === "ENOENT";
+  }
+}
+
 async function restoreRuntimeState(runtime, state) {
   const backupPath = state?.latest_backup_path;
   const codexConfigPath = state?.codex_config_path;
@@ -6864,8 +6884,11 @@ async function restoreRuntimeState(runtime, state) {
     ? state.client_configs.records
     : [];
 
-  if (codexConfigPath && (!backupPath || !fs.existsSync(backupPath) || !fs.statSync(backupPath).isFile())) {
+  if (codexConfigPath && !isRegularFilePath(backupPath)) {
     throw new Error(`未找到可恢复备份: ${backupPath || "unknown"}`);
+  }
+  if (codexConfigPath && !isRestorableTargetPath(codexConfigPath)) {
+    throw new Error(`Codex 配置路径不是普通文件: ${codexConfigPath}`);
   }
   if (!codexConfigPath && clientRecords.length === 0) {
     throw new Error("安装状态里没有可恢复的客户端配置");
@@ -6880,15 +6903,33 @@ async function restoreRuntimeState(runtime, state) {
     throw new Error(`客户端配置恢复冲突: ${clientRestorePreview.conflicts.length}`);
   }
 
-  if (codexConfigPath) {
-    await copyFile(backupPath, codexConfigPath);
-  }
   const clientRestore = await restoreClientConfigs({
     records: clientRecords,
     gatewayBaseUrl: state?.gateway_base_url,
   });
   if (clientRestore.conflicts.length > 0) {
     throw new Error(`客户端配置恢复冲突: ${clientRestore.conflicts.length}`);
+  }
+  try {
+    if (codexConfigPath) {
+      await copyFile(backupPath, codexConfigPath);
+    }
+  } catch (error) {
+    if (clientRestore.restored.length > 0) {
+      try {
+        await restoreClientConfigs({
+          records: clientRestore.restored.map((record) => ({
+            ...record,
+            originalBaseUrl: record.gatewayBaseUrl,
+            gatewayBaseUrl: record.originalBaseUrl,
+          })),
+          gatewayBaseUrl: state?.original_base_url,
+        });
+      } catch (rollbackError) {
+        throw new AggregateError([error, rollbackError], "Codex restore failed and client config rollback was incomplete.");
+      }
+    }
+    throw error;
   }
   await Promise.all([
     rm(runtime.paths.statePath, { force: true }),

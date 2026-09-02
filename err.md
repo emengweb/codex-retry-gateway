@@ -1,5 +1,29 @@
 # err.md
 
+## 2026-09-02 多客户端恢复边界与 provider 误接管
+
+### 现象
+
+- 安装状态中的 Codex 恢复备份路径如果是符号链接，旧校验会跟随链接并将其目标当成有效备份。
+- pi/OpenCode/ZCode provider 的兼容性判断只要任意标记包含 `openai` 就通过，可能将原生 `openai-responses` provider 接管到当前非协议转换 gateway。
+
+### 根因
+
+- Codex 控制面和管理页恢复入口使用 `stat` 判断备份是否为文件；`stat` 会解析符号链接。
+- 多客户端发现把“包含 OpenAI 名称”误等同于“当前 gateway 可代理的 OpenAI-compatible 协议”。
+
+### 处理
+
+- Codex 备份改用 `lstat`，只接受非符号链接的普通文件；管理脚本与管理页恢复入口采用同一边界。
+- 自动接管仅接受 `openai-completions`、`openai-chat-completions` 或带 `openai-compatible` 标记的 provider；原生 `openai-responses` 保持不变。
+- 恢复先执行客户端字段预检，且只有仍指向本次 gateway 的记录才会被恢复，外部改写保持冲突而不覆盖。
+
+### 防回归
+
+- `node .\scripts\test-client-configs.mjs` 覆盖原生 `openai-responses` 不被接管及兼容 provider 恢复。
+- `node .\scripts\test-install-restore.mjs` 覆盖目录型恢复点拒绝、Windows 有符号链接权限时的链接恢复点拒绝；无权限环境会明确输出跳过原因。
+- `node --check .\gateway.mjs`、`node --check .\scripts\admin-lib.mjs`、`git diff --check` 验证语法与补丁格式。
+
 ## 当前默认值说明
 
 - 早期排错记录里出现的 `guard_retry_attempts=3` 是历史默认；当前项目默认以 `gateway.mjs`、`config.example.json`、`README.md` 和 `build.md` 为准，默认值已经调整为 `5`。
