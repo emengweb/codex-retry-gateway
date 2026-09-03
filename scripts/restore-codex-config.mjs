@@ -10,8 +10,9 @@ import {
 async function main() {
   const options = parseOptions(process.argv);
   const result = await restoreCodexConfig({
-    stateRoot: options.stateRoot || DEFAULT_STATE_ROOT,
-    codexConfigPath: options.codexConfigPath || DEFAULT_CODEX_CONFIG_PATH,
+    stateRoot: options.stateRoot || process.env.STATE_ROOT || DEFAULT_STATE_ROOT,
+    codexConfigPath:
+      options.codexConfigPath || process.env.CODEX_CONFIG_PATH || DEFAULT_CODEX_CONFIG_PATH,
   });
 
   process.stdout.write("Restored Codex config\n");

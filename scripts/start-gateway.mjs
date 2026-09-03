@@ -9,13 +9,13 @@ import {
 
 async function main() {
   const options = parseOptions(process.argv, { booleanFlags: ["restart-if-running"] });
-  const stateRoot = options.stateRoot || DEFAULT_STATE_ROOT;
+  const stateRoot = options.stateRoot || process.env.STATE_ROOT || DEFAULT_STATE_ROOT;
   const paths = getGatewayStatePaths(stateRoot);
 
   const message = await startGateway({
     stateRoot,
-    configPath: options.configPath || paths.configPath,
-    logPath: options.logPath || paths.logPath,
+    configPath: options.configPath || process.env.CONFIG_PATH || paths.configPath,
+    logPath: options.logPath || process.env.LOG_PATH || paths.logPath,
     restartIfRunning: Boolean(options.restartIfRunning),
   });
 

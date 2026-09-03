@@ -7,9 +7,10 @@ import http from "node:http";
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import * as zlib from "node:zlib";
 
-const root = path.resolve(import.meta.dirname, "..");
+const root = path.resolve(fileURLToPath(new URL("..", import.meta.url)));
 const gatewayEntry = path.join(root, "gateway.mjs");
 
 function assert(condition, message) {

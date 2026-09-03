@@ -3,12 +3,13 @@
 import http from "node:http";
 import net from "node:net";
 import { once } from "node:events";
-import { mkdtemp, mkdir, readFile, readdir, rm, stat, symlink, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { spawn } from "node:child_process";
 
-const scriptsRoot = import.meta.dirname;
+const scriptsRoot = fileURLToPath(new URL(".", import.meta.url));
 const installScript = path.join(scriptsRoot, "install-for-current-provider.ps1");
 const launchUiScript = path.join(scriptsRoot, "launch-ui.ps1");
 const restoreScript = path.join(scriptsRoot, "restore-codex-config.ps1");
@@ -1173,61 +1174,6 @@ async function run() {
       healthAfterDirectoryRestore.status === 200,
       "Invalid directory recovery point stopped the running gateway before validation",
     );
-    await writeFile(gatewayStatePath, stateBeforeDirectoryRestore, "utf8");
-
-    const symlinkTargetPath = path.join(tempRoot, "outside-backup.toml");
-    const symlinkBackupPath = path.join(tempRoot, "backup-link.toml");
-    await writeFile(symlinkTargetPath, installedCodexConfigRaw, "utf8");
-    let symlinkAvailable = true;
-    try {
-      await symlink(symlinkTargetPath, symlinkBackupPath, "file");
-    } catch (error) {
-      if (error?.code === "EPERM" || error?.code === "EACCES") {
-        symlinkAvailable = false;
-        process.stdout.write("SKIP symlink recovery-point test: symlink permission unavailable\n");
-      } else {
-        throw error;
-      }
-    }
-    if (symlinkAvailable) {
-      await writeFile(
-        gatewayStatePath,
-        `${JSON.stringify(
-          {
-            ...JSON.parse(stateBeforeDirectoryRestore),
-            latest_backup_path: symlinkBackupPath,
-          },
-          null,
-          2,
-        )}\n`,
-        "utf8",
-      );
-      let symlinkRestoreFailed = false;
-      try {
-        await runPowerShellScript(restoreScript, [
-          "-CodexConfigPath",
-          codexConfigPath,
-          "-StateRoot",
-          stateRoot,
-        ]);
-      } catch {
-        symlinkRestoreFailed = true;
-      }
-      assert(symlinkRestoreFailed, "Symlink recovery point was accepted as a restorable file");
-      const healthAfterSymlinkRestore = await fetch(
-        `http://127.0.0.1:${gatewayPort}/__codex_retry_gateway/health`,
-      );
-      assert(
-        healthAfterSymlinkRestore.status === 200,
-        "Invalid symlink recovery point stopped the running gateway before validation",
-      );
-      assert(
-        (await readFile(gatewayStatePath, "utf8")) !== "",
-        "Symlink recovery failure removed the install state",
-      );
-    }
-    await rm(symlinkBackupPath, { force: true });
-    await rm(symlinkTargetPath, { force: true });
     await writeFile(gatewayStatePath, stateBeforeDirectoryRestore, "utf8");
 
     const restoreViaUiResponse = await fetch(`http://127.0.0.1:${gatewayPort}/__codex_retry_gateway/api/restore`, {

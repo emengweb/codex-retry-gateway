@@ -28,9 +28,8 @@ bash ./scripts/launch-ui.sh
 
 说明：
 
-- 第一次运行会自动安装并接管当前 Codex provider；如果 Codex 配置不存在，则从 pi、OpenCode、ZCode 中发现兼容 provider 并启动 client-only gateway
+- 第一次运行会自动安装并接管当前 Codex provider
 - 再次运行会先核对 provider、配置、PID 与 health：无变化且健康时零写入、零重启；停止时拉起；配置迁移时才重启
-- client-only 运行会在复用启动时发现并接管新出现的兼容 provider，恢复时只还原仍指向 gateway 的字段
 - provider 漂移时只恢复 gateway 接管；恢复备份缺失且当前 provider 指向真实上游时，会先保存该真实配置；切换 provider 时不会复用另一 provider 的备份
 - PID 必须与 health 返回的 `process_id` 一致才允许停止；陈旧 PID 不会终止无关存活进程
 - 手工 install 与 launch 共用恢复控制面；直接 start 也先验证 PID；新进程 health 必须回报自己的 `process_id`
@@ -42,7 +41,44 @@ bash ./scripts/launch-ui.sh
 - macOS / Linux 入口依赖 `bash` 和 `Node.js 18+`
 - 推荐显式使用 `bash ...sh`，避免跨平台复制后可执行位丢失
 
-## 只启动不自动开浏览器
+## Make 统一入口
+
+Windows / macOS / Linux 都可以在仓库根目录使用同一套 `make` 命令。前置依赖是 Node.js 18+ 与 GNU Make；Windows 可使用 `winget install ezwinports.make` 安装 GNU Make。
+
+```text
+make help
+make launch
+```
+
+目标说明：
+
+- `make launch`：安装或复用接管状态，启动 gateway，并打开管理页。
+- `make install`：安装或复用接管状态并启动 gateway，但不打开浏览器。
+- `make start`：只启动 gateway。
+- `make restart`：启动 gateway；如果已运行则先重启。
+- `make stop`：只停止 gateway，不恢复 Codex 原配置。
+- `make restore`：停止 gateway，并用备份恢复 Codex 原 `config.toml`。
+- `make check`：检查 Node 版本、入口脚本语法、SQLite runtime 合同和 Makefile 契约，不启动 gateway。
+
+简单开关使用 `ARGS` 传递：
+
+```text
+make launch ARGS="--no-open"
+make stop ARGS="--quiet"
+```
+
+路径和监听参数使用 Make 变量传递。它们会作为环境变量交给 Node，因此支持带空格的路径：
+
+```text
+make launch STATE_ROOT="D:/codex retry gateway" CODEX_CONFIG_PATH="D:/codex configs/config.toml"
+make launch LISTEN_HOST="127.0.0.1" LISTEN_PORT="4610" ARGS="--no-open"
+make start STATE_ROOT="D:/codex retry gateway" CONFIG_PATH="D:/gateway configs/config.json" LOG_PATH="D:/gateway logs/gateway.log"
+make restore STATE_ROOT="D:/codex retry gateway" CODEX_CONFIG_PATH="D:/codex configs/config.toml"
+```
+
+可用变量：`STATE_ROOT`、`CODEX_CONFIG_PATH`、`LISTEN_HOST`、`LISTEN_PORT`、`CONFIG_PATH`、`LOG_PATH`。不要把带空格的路径直接写进 `ARGS`。
+
+Make 入口最终调用 `scripts/*.mjs` 跨平台核心；PowerShell 与 Bash 入口仍可独立使用。
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\scripts\launch-ui.ps1 -NoOpen
@@ -79,28 +115,6 @@ macOS / Linux:
 ```bash
 bash ./scripts/restore-codex-config.sh
 ```
-
-## Make 生命周期命令
-
-如果本机安装了 GNU Make，可以直接使用统一的停止/恢复入口：
-
-```bash
-make stop
-make stop-only
-make restore
-```
-
-`make stop` 会执行完整的安全关闭：先校验恢复条件，停止 gateway，再恢复 Codex、pi、OpenCode、ZCode 中仍受管理的配置字段并删除安装状态。`make stop-only` 只停止并清理 PID 文件，不恢复配置、不删除安装状态。`make restore` 是 `make stop` 的显式长名称别名。恢复操作仍保留外部改写冲突保护，不会覆盖用户的新配置。
-
-自定义运行目录或 Codex 配置路径时：
-
-```bash
-make stop STATE_ROOT="D:/codex retry gateway"
-make stop-only STATE_ROOT="D:/codex retry gateway"
-make restore STATE_ROOT="D:/codex retry gateway" CODEX_CONFIG_PATH="D:/codex/config.toml"
-```
-
-Windows 也可以使用 `make`、`mingw32-make` 或对应的 GNU Make 命令；参数通过 `STATE_ROOT`、`CODEX_CONFIG_PATH` 和 `ARGS` 传递。
 
 ## 打开管理页面
 
@@ -187,9 +201,15 @@ reasoning 统计落盘说明：
 - 如果请求体传入 `source_paths`，只分析指定路径，不混入默认真实大库，便于测试和分段导入。
 - 历史导入先执行 preflight；缺少 `reasoning_tokens`、`final_answer_only`、`commentary_observed` 等核心字段时，标记 `no_analysis_value` 并停止候选特征分析。
 - CC Switch / Codex logs SQLite 使用聚合 SQL；session JSONL 第一版只做文件级索引和 top 大文件，不深解析完整会话正文。
+- 历史导入使用 Node.js 内置 `node:sqlite` 时不需要额外安装 `sqlite3` CLI；Node 18 等没有该内置模块的环境仍可通过 `SQLITE3_EXE` 或 PATH 中的 `sqlite3` CLI 工作。
 - 输出摘要写入 `<state_root>\analytics\imports\<job_id>\summary.json`，UI 只轮询任务进度和摘要。
 
 并发与日志说明：
+
+- 后台 retry attempt 按规范化 `upstream_base_url` + 模型在单进程内 FIFO 串行；模型优先取请求体，其次取本地配置，首个响应确认模型后可补建协调键，仍未知则跳过。首发不排队，客户端断开/总 deadline 会取消排队项；明确 Retry-After 会形成共享冷却，普通指数退避和预算仍由当前请求状态机负责。同键有等待者时默认最多增加 `10ms` 间隔；无固定租约强制释放，长期慢上游需配置 `latency_guard.total_timeout_ms`。
+- 状态接口的 `retry_coordination` 提供活动 attempt、队列深度、桶数量、冷却剩余、最大等待和冷却降级计数等运行观测；它不代表跨进程或网关外调用的全局限流。
+- 为避免协调器自身积压，默认最多保留单键 `16` 个、全进程 `64` 个等待 retry；超过后返回 `503 retry_coordination_overloaded` 并带 `Retry-After: 1`。
+- 协调器只覆盖客户端代理的 pending retry；主动探针和首发阶段网络二次 fetch 不在该锁范围内，不能把它当作跨进程全局限流。
 
 - gateway 是本机 Node.js 单进程异步代理，适合 Codex 本地路由和少量并发请求。
 - 日志在同一进程内通过单个 `WriteStream` 追加写入；当前模型下不会多进程抢写同一个日志文件。
@@ -202,11 +222,9 @@ reasoning 统计落盘说明：
 ```powershell
 node .\scripts\test-gateway-e2e.mjs
 node .\scripts\test-content-encoding.mjs
-node .\scripts\test-memory-guard.mjs
+node .\scripts\test-sqlite-runtime.mjs
+node .\scripts\test-shared-retry-coordination.mjs
 node .\scripts\test-install-restore.mjs
-node .\scripts\test-client-configs.mjs
-node .\scripts\test-client-only-install.mjs
-node .\scripts\test-makefile.mjs
 node .\scripts\test-launch-ui.mjs
 node .\scripts\test-launch-ui-unix.mjs
 node --check .\gateway.mjs
@@ -217,7 +235,6 @@ node --check .\scripts\test-gateway-e2e.mjs
 node --check .\scripts\test-install-restore.mjs
 node --check .\scripts\test-launch-ui.mjs
 node --check .\scripts\test-launch-ui-unix.mjs
-node --check .\scripts\test-makefile.mjs
 git diff --check
 ```
 

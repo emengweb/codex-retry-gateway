@@ -1,28 +1,30 @@
 # err.md
 
-## 2026-09-02 多客户端恢复边界与 provider 误接管
+## 2026-08-13 同渠道同模型后台重试需要进程内协调
 
 ### 现象
 
-- 安装状态中的 Codex 恢复备份路径如果是符号链接，旧校验会跟随链接并将其目标当成有效备份。
-- pi/OpenCode/ZCode provider 的兼容性判断只要任意标记包含 `openai` 就通过，可能将原生 `openai-responses` provider 接管到当前非协议转换 gateway。
+- 多个客户端请求同时命中 reasoning、Capacity/429、首 progress 或临时故障重试时，各请求自己的 `pendingRetryDispatch` 会在同一事件循环附近直接调用上游；同一渠道同一模型可能形成成批 retry，冲击上游接口。
 
 ### 根因
 
-- Codex 控制面和管理页恢复入口使用 `stat` 判断备份是否为文件；`stat` 会解析符号链接。
-- 多客户端发现把“包含 OpenAI 名称”误等同于“当前 gateway 可代理的 OpenAI-compatible 协议”。
+- 原有重试预算和退避只在单个 HTTP 请求内维护，没有跨请求的 dispatch 队列或互斥边界。
 
 ### 处理
 
-- Codex 备份改用 `lstat`，只接受非符号链接的普通文件；管理脚本与管理页恢复入口采用同一边界。
-- 自动接管仅接受 `openai-completions`、`openai-chat-completions` 或带 `openai-compatible` 标记的 provider；原生 `openai-responses` 保持不变。
-- 恢复先执行客户端字段预检，且只有仍指向本次 gateway 的记录才会被恢复，外部改写保持冲突而不覆盖。
+- 新增进程内 `RetryDispatchCoordinator`，以规范化 `upstream_base_url`（渠道）和模型组成协调键；模型优先取请求体，其次取本地配置，首个响应确认模型后可补建协调键；只包住真实后台 retry attempt，首发请求保持并发，不合并请求或共享响应。
+- 同键 retry FIFO 串行，不同模型/渠道互不阻塞；同键队列确有等待者时默认增加不超过 `10ms` 的最小派发间隔。锁在 `finally` 释放且不使用固定租约，慢流不会被强行视为完成；长期慢上游需由 `latency_guard.total_timeout_ms` 收口。
+- 排队 acquire 同时监听客户端断开和已有 total deadline；取消/超时不会继续派发上游，状态接口新增 `retry_coordination` 运行观测。共享冷却桶也有限额，达到上限会记录降级计数并恢复请求级退避。
+- 协调器自身设置有界保护：默认单键最多 `16` 个、全进程最多 `64` 个排队 retry；超限返回 `503 retry_coordination_overloaded` 和 `Retry-After: 1`，避免把上游冲击转移成网关内存/延迟无限增长。
+- 未知模型身份不会强行合并到 `unknown` 桶；首发响应确认模型后才尝试补建键，仍未知则跳过协调。明确 `Retry-After` 会写入同键共享冷却，普通本地退避仍只影响当前请求。
+- 原请求自己的指数退避、`guard_retry_attempts`、`transient_retry` 上限和 total deadline 保持事实来源；协调器不重置、不缩短这些时长。协调器只覆盖客户端代理 pending retry；主动探针、首发阶段底层网络二次 fetch、多个 gateway 进程和网关外直接调用不在范围内。
 
 ### 防回归
 
-- `node .\scripts\test-client-configs.mjs` 覆盖原生 `openai-responses` 不被接管及兼容 provider 恢复。
-- `node .\scripts\test-install-restore.mjs` 覆盖目录型恢复点拒绝、Windows 有符号链接权限时的链接恢复点拒绝；无权限环境会明确输出跳过原因。
-- `node --check .\gateway.mjs`、`node --check .\scripts\admin-lib.mjs`、`git diff --check` 验证语法与补丁格式。
+- `node ./scripts/test-retry-coordinator.mjs`：FIFO、不同键并行、取消、deadline、慢 attempt 显式释放。
+- `node ./scripts/test-shared-retry-coordination.mjs`：同渠道/模型 retry 不重叠、不同模型并行、客户端断开后不派发第二次。
+- `node ./scripts/test-shared-retry-coordination.mjs`：同时覆盖 Retry-After 共享冷却、瞬态退避不占锁、未知/推断模型和超长模型键。
+- `node ./scripts/test-gateway-e2e.mjs`：既有策略、Retry-After、首 progress 和 total deadline 闸门保持通过。
 
 ## 当前默认值说明
 
@@ -1840,6 +1842,39 @@
      - fake upstream 为 termination 响应附加专用测试 header；fault preload 在 `copyHeadersToClient()` 阻塞 100ms，并断言响应仍为 200、阻塞真实发生、`client_headers_sent_at_ms <= client_first_write_at_ms`。
      - RED 精确复现 header 在 `1784095029696ms` 发送、首写却记录为 `1784095029596ms`；GREEN 后完整 gateway E2E 首轮通过并连续 3/3 稳定复跑。
      - 2026-07-15 install-restore、Windows launch、Unix launch、六个 JS syntax、三份 PowerShell AST、完整 diff check 与临时进程 0 残留全部通过。
+
+### 2026-08-27 Make 统一入口与 Windows 测试路径兼容
+
+#### 现象
+
+- Makefile 直接将 `ARGS` 拼接到 recipe 时，带空格或 shell 特殊字符的路径会被 Windows cmd、Git Bash 或 POSIX shell 二次拆分。
+- Node.js 18 运行管理入口或测试入口时，`import.meta.dirname` 不可用。
+- Windows Git Bash 下测试把 `D:/...` 转成 `/mnt/d/...`，MSYS 会将其解析到 Git 安装目录，导致 `EPERM`；部分测试直接使用 URL pathname，形成 `D:\\D:\\...`。
+- 共享重试协调测试使用过短的 holder retry 窗口时，17 个并发请求偶发未能填满 16 个等待位，造成 503 队列上限断言竞态。
+
+#### 根因与处理
+
+- Makefile 的路径参数改为导出的 Make 环境变量：`STATE_ROOT`、`CODEX_CONFIG_PATH`、`LISTEN_HOST`、`LISTEN_PORT`、`CONFIG_PATH`、`LOG_PATH`；入口脚本从 `process.env` 读取，`NODE` 命令路径统一加引号。`ARGS` 只保留给简单开关。
+- 所有 Node 18 兼容入口使用 `fileURLToPath(new URL(..., import.meta.url))`，不再依赖 `import.meta.dirname`。
+- Windows 测试使用 `fileURLToPath` 解析文件 URL；Git Bash/MSYS 测试直接传 Windows 原生路径，`/mnt` 只保留给 WSL 场景。
+- 将共享协调测试的 holder retry 窗口延长到 `1000ms`，让队列上限场景具备确定性，不改变网关逻辑。
+
+#### 防回归
+
+- `make check`
+- `node scripts/test-launch-ui.mjs`
+- `node scripts/test-install-restore.mjs`
+- `node scripts/test-launch-ui-unix.mjs`
+- `node scripts/test-memory-guard.mjs`
+- `node scripts/test-shared-retry-coordination.mjs`
+- `node scripts/test-run-watchdog.mjs`
+- `node --check gateway.mjs` 与 `node --check scripts/*.mjs`
+
+### 2026-09-02 SQLite runtime 与 E2E CLI 依赖
+
+- 历史导入 SQLite 查询和 E2E fixture 建库优先使用动态加载的 Node `node:sqlite`，Node 18 等旧运行时仍回退到 `sqlite3` CLI；连接在 `finally` 中关闭，避免本机测试被全局 CLI 依赖阻塞。
+- `node scripts/test-sqlite-runtime.mjs` 验证无全局 `sqlite3` CLI 时的内置 SQLite 建库、只读查询和清理。
+- `node scripts/test-gateway-e2e.mjs` 已越过原有 `spawn sqlite3 ENOENT`；当前仍可能在后续毫秒级 deadline fault 注入断言失败，属于既有时序测试稳定性问题，需单独处理。
 
 ### 2026-06-26 实测证据
 

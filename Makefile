@@ -1,29 +1,68 @@
-# Codex Retry Gateway 生命周期命令
-# 需要 Node.js 18+ 和 GNU Make（Windows 可使用 mingw32-make 或 make）。
+# Codex Retry Gateway —— 跨平台统一命令入口（Windows / macOS / Linux）
+#
+# 设计说明：
+# - scripts/ 目录下所有 *.mjs 本身就是跨平台的 Node 核心（*.ps1 / *.sh 只是平台包装），
+#   因此本文件的所有目标一律直连 mjs，三个平台共用这一份 Makefile，无需任何 OS 分支。
+# - 前置依赖：Node.js 18+ 与 GNU Make（Windows 可用 winget/choco/scoop 安装 make）。
+# - 参数通过 ARGS 透传给底层脚本；它适合无空格的开关参数，例如：
+#     make launch ARGS="--no-open"
+#     make start ARGS="--restart-if-running"
+# - 路径和监听参数使用 Make 变量传递，Makefile 会将它们作为环境变量交给 Node，避免空格、反斜杠及 shell 特殊字符被拆分，例如：
+#     make launch STATE_ROOT="D:/codex retry gateway" CODEX_CONFIG_PATH="D:/codex configs/config.toml"
+#     make start CONFIG_PATH="D:/gateway configs/config.json" LOG_PATH="D:/gateway logs/gateway.log"
+# - 所有参数名使用 kebab-case（如 --no-open），与 mjs 核心的 parseOptions 保持一致。
+#
+# 运行时状态全部位于当前用户目录的 ~/.codex-retry-gateway，仓库目录保持干净。
 
 NODE ?= node
 ARGS ?=
-STATE_ROOT ?=
 CODEX_CONFIG_PATH ?=
+STATE_ROOT ?=
+LISTEN_HOST ?=
+LISTEN_PORT ?=
+CONFIG_PATH ?=
+LOG_PATH ?=
 
-STATE_ROOT_ARGS = $(if $(strip $(STATE_ROOT)),--state-root "$(STATE_ROOT)")
-CODEX_CONFIG_ARGS = $(if $(strip $(CODEX_CONFIG_PATH)),--codex-config-path "$(CODEX_CONFIG_PATH)")
+# 路径通过环境变量传给 Node，避免再次经过 Windows cmd 或 POSIX shell 的参数解析。
+export CODEX_CONFIG_PATH STATE_ROOT LISTEN_HOST LISTEN_PORT CONFIG_PATH LOG_PATH
 
-.PHONY: help stop stop-only restore
+.PHONY: help launch install start restart stop restore check
 
 .DEFAULT_GOAL := help
 
 help:
 	"$(NODE)" ./scripts/help.mjs
 
-# stop 是默认安全关闭：恢复受管配置并停止 gateway。
+launch:
+	"$(NODE)" ./scripts/launch-ui.mjs $(ARGS)
+
+install:
+	"$(NODE)" ./scripts/install-for-current-provider.mjs $(ARGS)
+
+start:
+	"$(NODE)" ./scripts/start-gateway.mjs $(ARGS)
+
+restart:
+	"$(NODE)" ./scripts/start-gateway.mjs --restart-if-running $(ARGS)
+
 stop:
-	"$(NODE)" ./scripts/restore-codex-config.mjs $(STATE_ROOT_ARGS) $(CODEX_CONFIG_ARGS) $(ARGS)
+	"$(NODE)" ./scripts/stop-gateway.mjs $(ARGS)
 
-# 仅在需要停止 gateway 但保留当前路由接管时使用 stop-only。
-stop-only:
-	"$(NODE)" ./scripts/stop-gateway.mjs $(STATE_ROOT_ARGS) $(ARGS)
-
-# 保留显式 restore 名称，便于脚本和偏好长命令名的用户使用。
 restore:
-	"$(NODE)" ./scripts/restore-codex-config.mjs $(STATE_ROOT_ARGS) $(CODEX_CONFIG_ARGS) $(ARGS)
+	"$(NODE)" ./scripts/restore-codex-config.mjs $(ARGS)
+
+check:
+	"$(NODE)" --version
+	"$(NODE)" --check gateway.mjs
+	"$(NODE)" --check scripts/admin-lib.mjs
+	"$(NODE)" --check scripts/launch-ui.mjs
+	"$(NODE)" --check scripts/install-for-current-provider.mjs
+	"$(NODE)" --check scripts/start-gateway.mjs
+	"$(NODE)" --check scripts/stop-gateway.mjs
+	"$(NODE)" --check scripts/restore-codex-config.mjs
+	"$(NODE)" --check scripts/help.mjs
+	"$(NODE)" --check scripts/test-makefile.mjs
+	"$(NODE)" --check scripts/sqlite-runtime.mjs
+	"$(NODE)" --check scripts/test-sqlite-runtime.mjs
+	"$(NODE)" ./scripts/test-sqlite-runtime.mjs
+	"$(NODE)" ./scripts/test-makefile.mjs

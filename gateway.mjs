@@ -1,6 +1,5 @@
 #!/usr/bin/env node
 
-import { execFile } from "node:child_process";
 import crypto from "node:crypto";
 import http from "node:http";
 import { copyFile, mkdir, readdir, readFile, rm, writeFile } from "node:fs/promises";
@@ -9,7 +8,8 @@ import path from "node:path";
 import { TextDecoder } from "node:util";
 import { fileURLToPath } from "node:url";
 import * as zlib from "node:zlib";
-import { restoreClientConfigs } from "./scripts/client-configs.mjs";
+import { RetryDispatchCoordinator } from "./retry-coordinator.mjs";
+import { sqliteJsonRows } from "./scripts/sqlite-runtime.mjs";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -93,6 +93,7 @@ const MAX_RETRY_AFTER_MS = 60 * 1000;
 const TRANSIENT_RETRY_MAX_DELAY_MS = 10 * 60 * 1000;
 const MAX_GUARD_RETRY_ATTEMPTS = 32;
 const MAX_TRANSIENT_RETRY_ATTEMPTS = 16;
+const RETRY_COORDINATION_MAX_PART_LENGTH = 1024;
 const TRANSIENT_RETRYABLE_HTTP_STATUSES = new Set([
   408,
   425,
@@ -4260,20 +4261,6 @@ function buildFeatureAnalysisFromSamples(samples, profile) {
   };
 }
 
-function execFileText(command, args, options = {}) {
-  return new Promise((resolve, reject) => {
-    execFile(command, args, { windowsHide: true, ...options }, (error, stdout, stderr) => {
-      if (error) {
-        error.stdout = stdout;
-        error.stderr = stderr;
-        reject(error);
-        return;
-      }
-      resolve(`${stdout || ""}`);
-    });
-  });
-}
-
 function normalizeOptionalPath(value) {
   const text = typeof value === "string" ? value.trim() : "";
   return text ? path.resolve(text) : null;
@@ -4323,18 +4310,6 @@ function buildHistoricalImportSources(payload = {}) {
     seen.add(key);
     return true;
   });
-}
-
-async function sqliteJsonRows(databasePath, sql) {
-  const stdout = await execFileText("sqlite3", ["-json", databasePath, sql], {
-    maxBuffer: 16 * 1024 * 1024,
-  });
-  const text = stdout.trim();
-  if (!text) {
-    return [];
-  }
-  const parsed = JSON.parse(text);
-  return Array.isArray(parsed) ? parsed : [];
 }
 
 async function sqliteJsonRowsSafe(databasePath, sql) {
@@ -6857,85 +6832,22 @@ async function readRuntimeState(runtime) {
   };
 }
 
-function isRegularFilePath(filePath) {
-  if (!filePath || !fs.existsSync(filePath)) {
-    return false;
-  }
-  const fileStats = fs.lstatSync(filePath);
-  return fileStats.isFile() && !fileStats.isSymbolicLink();
-}
-
-function isRestorableTargetPath(filePath) {
-  if (!filePath) {
-    return true;
-  }
-  try {
-    const fileStats = fs.lstatSync(filePath);
-    return fileStats.isFile() && !fileStats.isSymbolicLink();
-  } catch (error) {
-    return error?.code === "ENOENT";
-  }
-}
-
 async function restoreRuntimeState(runtime, state) {
   const backupPath = state?.latest_backup_path;
   const codexConfigPath = state?.codex_config_path;
-  const clientRecords = Array.isArray(state?.client_configs?.records)
-    ? state.client_configs.records
-    : [];
 
-  if (codexConfigPath && !isRegularFilePath(backupPath)) {
+  if (!backupPath || !fs.existsSync(backupPath) || !fs.statSync(backupPath).isFile()) {
     throw new Error(`未找到可恢复备份: ${backupPath || "unknown"}`);
   }
-  if (codexConfigPath && !isRestorableTargetPath(codexConfigPath)) {
-    throw new Error(`Codex 配置路径不是普通文件: ${codexConfigPath}`);
-  }
-  if (!codexConfigPath && clientRecords.length === 0) {
-    throw new Error("安装状态里没有可恢复的客户端配置");
+  if (!codexConfigPath) {
+    throw new Error("安装状态里缺少 codex_config_path");
   }
 
-  const clientRestorePreview = await restoreClientConfigs({
-    records: clientRecords,
-    gatewayBaseUrl: state?.gateway_base_url,
-    dryRun: true,
-  });
-  if (clientRestorePreview.conflicts.length > 0) {
-    throw new Error(`客户端配置恢复冲突: ${clientRestorePreview.conflicts.length}`);
-  }
-
-  const clientRestore = await restoreClientConfigs({
-    records: clientRecords,
-    gatewayBaseUrl: state?.gateway_base_url,
-  });
-  if (clientRestore.conflicts.length > 0) {
-    throw new Error(`客户端配置恢复冲突: ${clientRestore.conflicts.length}`);
-  }
-  try {
-    if (codexConfigPath) {
-      await copyFile(backupPath, codexConfigPath);
-    }
-  } catch (error) {
-    if (clientRestore.restored.length > 0) {
-      try {
-        await restoreClientConfigs({
-          records: clientRestore.restored.map((record) => ({
-            ...record,
-            originalBaseUrl: record.gatewayBaseUrl,
-            gatewayBaseUrl: record.originalBaseUrl,
-          })),
-          gatewayBaseUrl: state?.original_base_url,
-        });
-      } catch (rollbackError) {
-        throw new AggregateError([error, rollbackError], "Codex restore failed and client config rollback was incomplete.");
-      }
-    }
-    throw error;
-  }
+  await copyFile(backupPath, codexConfigPath);
   await Promise.all([
     rm(runtime.paths.statePath, { force: true }),
     rm(runtime.paths.pidPath, { force: true }),
   ]);
-  return clientRestore;
 }
 
 function jsonResponse(res, statusCode, payload, headers = {}) {
@@ -10998,15 +10910,8 @@ function buildManagementHtml() {
 </html>`;
 }
 
-function isLoopbackAddress(address) {
-  if (!address) {
-    return false;
-  }
-  const normalized = `${address}`.replace(/^::ffff:/, "");
-  return normalized === "127.0.0.1" || normalized === "::1";
-}
-
-async function handleManagementRequest(runtime, req, res, requestUrl) {  const pathname = normalizePath(requestUrl.pathname);
+async function handleManagementRequest(runtime, req, res, requestUrl) {
+  const pathname = normalizePath(requestUrl.pathname);
 
   if (pathname === FAVICON_PATH) {
     res.writeHead(204);
@@ -11035,6 +10940,7 @@ async function handleManagementRequest(runtime, req, res, requestUrl) {  const p
         log_path: runtime.logPath,
       },
       metrics: buildMetricsSnapshot(runtime.monitor),
+      retry_coordination: runtime.retryDispatchCoordinator.snapshot(),
       reasoning_behavior: buildReasoningBehaviorRuntimeSnapshot(runtime),
       model_insights: buildModelInsightsSnapshot(runtime),
       active_probe: buildActiveProbeSnapshot(runtime),
@@ -11458,15 +11364,6 @@ async function handleManagementRequest(runtime, req, res, requestUrl) {  const p
   }
 
   if (pathname === RESTORE_API_PATH && req.method === "POST") {
-    if (!isLoopbackAddress(req.socket?.remoteAddress)) {
-      jsonResponse(res, 403, {
-        error: {
-          message: "恢复接口只允许本机访问",
-          code: "loopback_required",
-        },
-      });
-      return true;
-    }
     const state = await readRuntimeState(runtime);
     if (!state) {
       jsonResponse(res, 409, {
@@ -11578,6 +11475,42 @@ function createRequestBodyLimitExceededError(limitBytes) {
   error.errorType = "gateway_rejection";
   error.logCategory = "gateway-reject";
   return error;
+}
+
+function normalizeRetryCoordinationPart(value, fallback = "unknown") {
+  const normalized = normalizeNonEmptyString(value);
+  if (!normalized) {
+    return fallback;
+  }
+  if (normalized.length <= RETRY_COORDINATION_MAX_PART_LENGTH) {
+    return normalized;
+  }
+  const digest = crypto
+    .createHash("sha256")
+    .update(normalized, "utf8")
+    .digest("hex")
+    .slice(0, 32);
+  const prefixLength = Math.max(1, RETRY_COORDINATION_MAX_PART_LENGTH - digest.length - 1);
+  return `${normalized.slice(0, prefixLength)}-${digest}`;
+}
+
+function buildRetryCoordinationKey(config, requestJson, localConfigModel) {
+  let channel;
+  try {
+    const upstream = new URL(config?.upstream_base_url || "");
+    const pathname = upstream.pathname.replace(/\/+$/, "") || "/";
+    channel = `${upstream.protocol}//${upstream.host}${pathname}`;
+  } catch {
+    channel = normalizeRetryCoordinationPart(config?.upstream_base_url);
+  }
+  const model = normalizeNonEmptyString(requestJson?.model) || normalizeNonEmptyString(localConfigModel);
+  if (!model) {
+    return null;
+  }
+  return JSON.stringify([
+    normalizeRetryCoordinationPart(channel),
+    normalizeRetryCoordinationPart(model),
+  ]);
 }
 
 function createRequestContentEncodingError(encoding, cause = null) {
@@ -13516,6 +13449,42 @@ async function proxyRequest(runtime, req, res) {
   requestTracking.localConfigModel = localConfigModel;
   const requestIsStream = Boolean(requestJson?.stream);
   const upstreamUrl = buildUpstreamUrl(config.upstream_base_url, incomingUrl);
+  let retryCoordinationKey = buildRetryCoordinationKey(
+    config,
+    requestJson,
+    localConfigModel,
+  );
+  const inferRetryCoordinationKey = (modelContext) => {
+    if (retryCoordinationKey) {
+      return;
+    }
+    const inferredModel =
+      normalizeNonEmptyString(modelContext?.upstreamModel) ||
+      normalizeNonEmptyString(modelContext?.streamModel) ||
+      normalizeNonEmptyString(modelContext?.finalResponseModel) ||
+      normalizeNonEmptyString([...(modelContext?.observedModels || [])][0]);
+    if (inferredModel) {
+      retryCoordinationKey = buildRetryCoordinationKey(
+        config,
+        { model: inferredModel },
+        null,
+      );
+    }
+  };
+  const deferSharedRetryAfter = (retryAfterMs, maxDelayMs = MAX_RETRY_AFTER_MS) => {
+    const parsedRetryAfterMs = Number(retryAfterMs);
+    if (
+      !retryCoordinationKey ||
+      !Number.isFinite(parsedRetryAfterMs) ||
+      parsedRetryAfterMs <= 0
+    ) {
+      return;
+    }
+    runtime.retryDispatchCoordinator.defer(
+      retryCoordinationKey,
+      Date.now() + Math.min(maxDelayMs, parsedRetryAfterMs),
+    );
+  };
   const shouldInspect = matchPath(config, pathname);
   const transientRetryEnabledForRequest =
     shouldInspect && config.transient_retry?.enabled === true;
@@ -13617,6 +13586,80 @@ async function proxyRequest(runtime, req, res) {
       blockedResponseAlreadyRecorded: pendingRetry.blockedResponseAlreadyRecorded,
       modelInsightsAlreadyFinalized: pendingRetry.modelInsightsAlreadyFinalized,
     });
+  };
+
+  const handlePendingRetryDispatchCancellation = (pendingRetry, reason) => {
+    if (reason === "deadline") {
+      pendingRetry.latencyGuard?.expireTotalDeadlineIfNeeded({ overrideExisting: true });
+      handlePendingRetryTotalTimeout(pendingRetry);
+      return;
+    }
+    if (reason === "overloaded") {
+      setRequestTrackingOutcome(requestTracking, "failed");
+      if (!pendingRetry.modelInsightsAlreadyFinalized) {
+        finalizeModelInsights(
+          runtime.monitor,
+          pathname,
+          pendingRetry.modelContext,
+          pendingRetry.errorPayload,
+        );
+      }
+      completeReasoningBehaviorSample({
+        runtime,
+        sample: pendingRetry.reasoningSample,
+        structure: pendingRetry.structureAccumulator,
+        modelContext: pendingRetry.modelContext,
+        finalAction: "retry_coordination_overloaded",
+        clientHttpStatus: 503,
+        matchedCurrentRule: pendingRetry.matchedCurrentRule,
+        blockedByGateway: true,
+        failureSummary: buildFailureSummary(new Error("retry coordination queue is full")),
+        requestFinishedAtMs: Date.now(),
+        latestLogSeq: runtime.monitor.next_log_seq - 1,
+      });
+      if (!res.headersSent) {
+        res.writeHead(503, {
+          "content-type": "application/json; charset=utf-8",
+          "retry-after": "1",
+          "x-codex-retry-gateway-reason": "retry-coordination-overloaded",
+        });
+        res.end(JSON.stringify({
+          error: {
+            type: "codex_retry_gateway_overloaded",
+            code: "retry_coordination_overloaded",
+            message: "同一渠道和模型的后台重试队列已满，请稍后再试。",
+          },
+        }));
+      }
+      return;
+    }
+    setRequestTrackingOutcome(requestTracking, "client_disconnected");
+    if (!pendingRetry.modelInsightsAlreadyFinalized) {
+      finalizeModelInsights(
+        runtime.monitor,
+        pathname,
+        pendingRetry.modelContext,
+        pendingRetry.errorPayload,
+      );
+    }
+    completeReasoningBehaviorSample({
+      runtime,
+      sample: pendingRetry.reasoningSample,
+      structure: pendingRetry.structureAccumulator,
+      modelContext: pendingRetry.modelContext,
+      finalAction: "client_disconnected",
+      clientHttpStatus: null,
+      matchedCurrentRule: pendingRetry.matchedCurrentRule,
+      blockedByGateway: false,
+      failureSummary: buildFailureSummary(
+        new Error("client disconnected while waiting for retry dispatch"),
+      ),
+      requestFinishedAtMs: Date.now(),
+      latestLogSeq: runtime.monitor.next_log_seq - 1,
+    });
+    if (!res.writableEnded) {
+      res.destroy();
+    }
   };
 
   const waitForTransientRetry = async ({
@@ -13737,9 +13780,33 @@ async function proxyRequest(runtime, req, res) {
     );
     const structureAccumulator = createStructureAccumulator();
     let latencyGuard = null;
+    let retryLease = null;
 
     try {
       const upstreamHeaders = cloneHeadersForUpstream(requestHeadersForUpstream);
+      if (pendingRetryDispatch && retryCoordinationKey) {
+        const leaseResult = await runtime.retryDispatchCoordinator.acquire(
+          retryCoordinationKey,
+          {
+            signal: requestTracking.client_disconnect_signal,
+            deadlineAtMs: requestTracking.total_deadline_at_ms,
+          },
+        );
+        if (!leaseResult.acquired) {
+          const cancelledRetry = pendingRetryDispatch;
+          pendingRetryDispatch = null;
+          const cancellationReason =
+            requestTracking.client_disconnect_signal?.aborted
+              ? "aborted"
+              : leaseResult.reason;
+          if (cancellationReason === "deadline") {
+            cancelledRetry.latencyGuard?.expireTotalDeadlineIfNeeded({ overrideExisting: true });
+          }
+          handlePendingRetryDispatchCancellation(cancelledRetry, cancellationReason);
+          return;
+        }
+        retryLease = leaseResult;
+      }
       const upstreamFetchStartedAtMs = Date.now();
       if (
         pendingRetryDispatch?.latencyGuard.expireTotalDeadlineIfNeeded({
@@ -13749,6 +13816,8 @@ async function proxyRequest(runtime, req, res) {
       ) {
         const timedOutRetry = pendingRetryDispatch;
         pendingRetryDispatch = null;
+        retryLease?.release();
+        retryLease = null;
         handlePendingRetryTotalTimeout(timedOutRetry);
         return;
       }
@@ -13909,9 +13978,28 @@ async function proxyRequest(runtime, req, res) {
             upstreamResponse,
             res,
             latencyGuard,
-          });
+      });
+      inferRetryCoordinationKey(modelContext);
+      // 只有已进入 retry 且带有明确 Retry-After 的 attempt 才升级为共享冷却；
+      // 普通本地退避和最终透传保持原请求级语义。
+      const sharedRetryAfterMs =
+        reasoningSample.retry_after_ms !== null &&
+        reasoningSample.retry_after_ms !== undefined &&
+        Number.isFinite(Number(reasoningSample.retry_after_ms)) &&
+        (handlerResult?.transientRetry || handlerResult?.policyRetry)
+          ? handlerResult.retryDelayMs
+          : null;
+      deferSharedRetryAfter(
+        sharedRetryAfterMs,
+        handlerResult?.transientRetry
+          ? TRANSIENT_RETRY_MAX_DELAY_MS
+          : MAX_RETRY_AFTER_MS,
+      );
 
       if (handlerResult?.transientRetry) {
+        // 本次上游 attempt 已完整结束；本地瞬时退避不应继续占用同键派发 turn。
+        retryLease?.release();
+        retryLease = null;
         const scheduled = await waitForTransientRetry({
           retryDelayMs: handlerResult.retryDelayMs,
           trigger: handlerResult.transientFailure?.trigger || "transient_upstream_failure",
@@ -13932,6 +14020,9 @@ async function proxyRequest(runtime, req, res) {
         handlerResult?.policyRetry &&
         guardRetryAttemptsUsed < Number(config.guard_retry_attempts || 0)
       ) {
+        // 本次上游 attempt 已完整结束；Retry-After 等本地等待不应继续占用同键派发 turn。
+        retryLease?.release();
+        retryLease = null;
         const delayCompleted = await waitForRetryDelay(
           handlerResult.retryDelayMs,
           abortController.signal,
@@ -14064,6 +14155,7 @@ async function proxyRequest(runtime, req, res) {
       }
       return;
     } catch (error) {
+      inferRetryCoordinationKey(modelContext);
       if (requestTracking.client_disconnect_signal?.aborted) {
         runtime.monitor.failed_proxy_request_count += 1;
         setRequestTrackingOutcome(requestTracking, "client_disconnected");
@@ -14131,6 +14223,9 @@ async function proxyRequest(runtime, req, res) {
         });
         runtime.monitor.failed_proxy_request_count += 1;
         setRequestTrackingOutcome(requestTracking, "failed");
+        // 连接错误的上游 attempt 同样已结束，退避等待期间允许同键 peer 派发。
+        retryLease?.release();
+        retryLease = null;
         const scheduled = await waitForTransientRetry({
           retryDelayMs: retryDelay.retryDelayMs,
           trigger: "transient_connection_error",
@@ -14169,6 +14264,7 @@ async function proxyRequest(runtime, req, res) {
       recordReasoningBehaviorSample(runtime, reasoningSample);
       throw error;
     } finally {
+      retryLease?.release();
       latencyGuard?.clear();
       requestTracking.client_disconnect_signal?.removeEventListener(
         "abort",
@@ -14201,6 +14297,7 @@ async function main() {
     reasoningBehavior: createReasoningBehaviorState(),
     historicalImports: createHistoricalImportState(),
     probeMonitor,
+    retryDispatchCoordinator: new RetryDispatchCoordinator(),
     paths: buildRuntimePaths(configPath, args.log || null),
     localConfigModelCache: null,
     server: null,

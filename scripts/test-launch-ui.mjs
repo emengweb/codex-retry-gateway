@@ -6,9 +6,10 @@ import { once } from "node:events";
 import { mkdtemp, mkdir, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { spawn } from "node:child_process";
 
-const scriptsRoot = import.meta.dirname;
+const scriptsRoot = fileURLToPath(new URL(".", import.meta.url));
 const launchScript = path.join(scriptsRoot, "launch-ui.ps1");
 const startScript = path.join(scriptsRoot, "start-gateway.ps1");
 const stopScript = path.join(scriptsRoot, "stop-gateway.ps1");

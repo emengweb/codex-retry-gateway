@@ -4,9 +4,10 @@ import assert from "node:assert/strict";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { spawn } from "node:child_process";
 
-const root = path.resolve(import.meta.dirname, "..");
+const root = path.resolve(fileURLToPath(new URL("..", import.meta.url)));
 const tempRoot = await mkdtemp(path.join(os.tmpdir(), "codex-retry-watchdog-"));
 const stateRoot = path.join(tempRoot, "state");
 const fakeLauncher = path.join(tempRoot, "fake-launcher.mjs");

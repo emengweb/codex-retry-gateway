@@ -6,10 +6,11 @@ import { once } from "node:events";
 import { mkdtemp, mkdir, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { spawn } from "node:child_process";
 import * as adminLib from "./admin-lib.mjs";
 
-const scriptsRoot = import.meta.dirname;
+const scriptsRoot = fileURLToPath(new URL(".", import.meta.url));
 const launchScript = path.join(scriptsRoot, "launch-ui.sh");
 const installScript = path.join(scriptsRoot, "install-for-current-provider.sh");
 const startScript = path.join(scriptsRoot, "start-gateway.sh");
@@ -73,7 +74,8 @@ function toUnixPathForBash(inputPath) {
   if (process.platform !== "win32") {
     return inputPath;
   }
-  return `/mnt/${inputPath.slice(0, 1).toLowerCase()}${inputPath.slice(2).replace(/\\/g, "/")}`;
+  // Git Bash 可以把 Windows 原生路径直接传给 node.exe；/mnt 形式只适用于 WSL。
+  return inputPath;
 }
 
 async function getFreePort() {

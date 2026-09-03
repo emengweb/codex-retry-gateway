@@ -47,26 +47,12 @@ TG群：[https://t.me/AI_INPUT_IM](https://t.me/AI_INPUT_IM)
 Windows:
 
 - Codex 配置：`%USERPROFILE%\.codex\config.toml`
-- pi 配置：`%USERPROFILE%\.pi\agent\models.json`
-- OpenCode 配置：`%USERPROFILE%\.config\opencode\opencode.jsonc` 或 `opencode.json`
-- ZCode 配置：`%USERPROFILE%\.zcode\v2\config.json`
 - Gateway 状态目录：`%USERPROFILE%\.codex-retry-gateway`
 
 macOS / Linux:
 
 - Codex 配置：`~/.codex/config.toml`
-- pi 配置：`~/.pi/agent/models.json`
-- OpenCode 配置：`~/.config/opencode/opencode.jsonc` 或 `opencode.json`
-- ZCode 配置：`~/.zcode/v2/config.json`
 - Gateway 状态目录：`~/.codex-retry-gateway`
-
-自动接管范围：
-
-- 仅改写 pi、OpenCode、ZCode 中标记为 OpenAI-compatible 的 provider。
-- 只有与当前 gateway upstream 完全一致的 URL 才会接管；其它协议或不同 upstream 会跳过并写入状态报告。
-- 配置改写按字段执行，保留 OpenCode JSONC 注释和用户无关内容；每个改写文件都会在 gateway 状态目录的 `backups` 下保存快照。
-- 恢复只改回仍指向本次 gateway 的字段；发现用户外部改写时报告冲突，不覆盖新值。
-- Codex 配置不存在时，只要发现可用的兼容客户端配置，仍可启动 client-only gateway。
 
 ## 当前版本说明
 
@@ -90,6 +76,26 @@ macOS / Linux:
 ```bash
 bash ./scripts/launch-ui.sh
 ```
+
+跨平台统一入口（Windows / macOS / Linux 通用，前置：Node.js 18+ 与 GNU Make）：
+
+```text
+make launch
+```
+
+根目录 `Makefile` 直连 `scripts/` 下的跨平台 Node 核心，三个平台共用同一份文件和同一批命令：`launch` / `install` / `start` / `restart` / `stop` / `restore` / `check`。
+
+参数传递分两类：
+
+- 简单开关通过 `ARGS` 透传，例如 `make launch ARGS="--no-open"`、`make restart ARGS="--restart-if-running"`。
+- 路径和监听参数使用 Make 变量传递。Makefile 会把它们作为环境变量交给 Node，不会让路径再次经过 shell 分词，因此支持空格、反斜杠和 shell 特殊字符。例如：
+
+```text
+make launch STATE_ROOT="D:/codex retry gateway" CODEX_CONFIG_PATH="D:/codex configs/config.toml"
+make start CONFIG_PATH="D:/gateway configs/config.json" LOG_PATH="D:/gateway logs/gateway.log"
+```
+
+可用变量包括 `STATE_ROOT`、`CODEX_CONFIG_PATH`、`LISTEN_HOST`、`LISTEN_PORT`、`CONFIG_PATH` 和 `LOG_PATH`。不要把带空格的路径直接写进 `ARGS`。Makefile 契约由 `scripts/test-makefile.mjs` 守护，可用 `make check` 自检。
 
 这个脚本是默认入口，执行后会自动完成：
 
@@ -134,28 +140,16 @@ bash ./scripts/launch-ui.sh --no-open
 
 - Windows 参数：
   - `-CodexConfigPath`
-  - `-PiConfigPath`
-  - `-OpenCodeConfigPath`
-  - `-ZcodeConfigPath`
   - `-StateRoot`
   - `-ListenHost`
   - `-ListenPort`
   - `-NoOpen`
 - macOS / Linux 参数：
   - `--codex-config-path`
-  - `--pi-config-path`
-  - `--opencode-config-path`
-  - `--zcode-config-path`
   - `--state-root`
   - `--listen-host`
   - `--listen-port`
   - `--no-open`
-
-client-only 场景：
-
-- 当 Codex 配置不存在时，启动入口会按 pi、OpenCode、ZCode 的默认路径自动发现兼容 provider。
-- 也可以通过上面的客户端路径参数指定临时或非默认配置文件。
-- 恢复入口会停止 gateway，恢复所有仍受管理的客户端字段，并清理安装状态；外部改写会作为冲突返回且不会被覆盖。
 
 macOS / Linux 说明：
 
@@ -201,28 +195,6 @@ bash ./scripts/restore-codex-config.sh
 - 用最近一次备份恢复当前用户目录下的 Codex `config.toml`
 - 删除当前安装状态文件
 - 如果 state 没有指向真实存在的备份文件，脚本会明确失败；不会用已经指向 gateway 的配置伪造恢复点
-
-## Make 生命周期命令
-
-如果本机安装了 GNU Make，可以直接使用：
-
-```bash
-make stop
-make stop-only
-make restore
-```
-
-`make stop` 会执行完整的安全关闭：先校验恢复条件，停止 gateway，再恢复 Codex、pi、OpenCode、ZCode 中仍受管理的配置字段并删除安装状态。`make stop-only` 只停止并清理 PID 文件，不恢复配置、不删除安装状态。`make restore` 是 `make stop` 的显式长名称别名。恢复操作仍保留外部改写冲突保护，不会覆盖用户的新配置。
-
-自定义路径示例：
-
-```bash
-make stop STATE_ROOT="D:/codex retry gateway"
-make stop-only STATE_ROOT="D:/codex retry gateway"
-make restore STATE_ROOT="D:/codex retry gateway" CODEX_CONFIG_PATH="D:/codex/config.toml"
-```
-
-Windows 可使用 `make` 或 `mingw32-make`；底层仍复用 Node 生命周期核心。
 
 ## 管理页面
 
@@ -523,10 +495,11 @@ powershell -ExecutionPolicy Bypass -File .\scripts\start-gateway.ps1 -RestartIfR
 bash ./scripts/start-gateway.sh --restart-if-running
 ```
 
-请求体编码回归：
+请求体编码与内存守卫回归：
 
 ```bash
 node ./scripts/test-content-encoding.mjs
+node ./scripts/test-memory-guard.mjs
 ```
 
 如果你已经打开管理页，优先直接在页面里改；少数未暴露成页面输入项的字段，例如 `continuation_marker_text`，再通过 `config.json` 或配置 API 调整。
@@ -537,6 +510,10 @@ node ./scripts/test-content-encoding.mjs
 
 - 可以同时处理多个 Codex 请求；每个请求都会独立读取请求体、请求上游、检查响应并更新统计。
 - `guard_retry_attempts` 的内部重试是按单个客户端请求独立计算的，不会和其他并发请求共享重试次数。
+- 后台 retry 的真实上游 attempt 会按“规范化 `upstream_base_url`（渠道）+ 模型”分桶；同一桶 FIFO 串行，不同模型/渠道仍可并行。模型优先取请求体 `model`，其次取本地配置；两者都缺失时首发不排队，若首个响应确认了模型，后续 retry 会尝试使用该身份，仍未知则跳过协调，避免错误合并到 `unknown` 桶。首发请求不排队，原请求自己的指数退避、预算和 total deadline 不会被重置或缩短；明确的 `Retry-After` 会形成同键共享冷却，普通本地退避仍只影响当前请求；同键确有等待者时最多增加默认 `10ms` 的队列间隔。
+- 排队中的客户端断开或请求总 deadline 到期会移出队列，不会继续向上游派发；管理接口 `/__codex_retry_gateway/api/status` 的 `retry_coordination` 字段可观察当前活动桶、队列深度、冷却剩余和降级计数。
+- 为避免保护机制自身积压，协调器默认限制单键等待 `16` 个、全进程等待 `64` 个；超限的后台 retry 以 `503 retry_coordination_overloaded` 和 `Retry-After: 1` 优雅收口。
+- 协调器只包住客户端代理状态机的 pending retry；主动探针仍使用独立的串行探针流程，首发阶段底层网络错误的内部二次 fetch 也不进入这把锁。
 - 日志写入使用同一个进程内 `WriteStream` 追加到日志文件；在当前单进程模型下，日志写入会按事件循环顺序排队，不会出现多进程同时抢写同一个日志文件的问题。
 - UI 实时日志来自内存里的 `log_entries`，文件日志和 UI 日志都会记录同一类事件。
 
@@ -548,6 +525,9 @@ node ./scripts/test-content-encoding.mjs
 - 超过 `request_body_limit_bytes` 的请求会被本地 gateway 直接拒绝，并返回 `413 request_body_limit_exceeded`；这类情况不是上游故障。
 - 当前 `log_entries` 是本次启动以来的内存累计；长时间高频运行会增加内存占用。
 - 如果要把它放到公网或很高 QPS 场景，建议前面加成熟反向代理，并补日志轮转、内存日志上限、压测和进程守护。
+- 协调范围仅限单个 gateway 进程；多个 gateway 实例、网关外部直接调用上游、或不同的上游 URL 不会共享这把锁。队列只收敛后台 retry，不是全局限流器。
+- 这是一种单进程内的派发保证，不是对上游最终行为的绝对保证；模型身份缺失、进程崩溃、多个实例或网关外直接调用都可能绕过它。
+- 若上游 retry attempt 本身长期不返回，协调器不会用固定租约强行释放锁；应启用 `latency_guard.total_timeout_ms` 或在前置反向代理设置超时，让请求以可观测的 timeout 收口。
 
 ## 其他机器如何应用
 
@@ -578,7 +558,8 @@ macOS / Linux: ~/.codex-retry-gateway
 ## 已验证事项
 
 - 本地 CI 为默认验收入口
-  - 优先在本机运行 `test-gateway-e2e.ps1` / `test-install-restore.ps1` / `test-client-configs.mjs` / `test-client-only-install.mjs` / `test-launch-ui.ps1` / `test-launch-ui-unix.ps1`
+  - 优先在本机运行 `test-gateway-e2e.ps1` / `test-install-restore.ps1` / `test-launch-ui.ps1` / `test-launch-ui-unix.ps1`
+  - 跨平台 Node 版等价脚本：`node ./scripts/test-gateway-e2e.mjs` / `node ./scripts/test-install-restore.mjs` / `node ./scripts/test-content-encoding.mjs` / `node ./scripts/test-memory-guard.mjs`
   - GitHub Actions `macos-smoke` 已在仓库侧手动禁用，push / PR 不再自动运行
   - 需要补足“本地没有 mac”时的 Unix 入口冒烟时，再按需手动重新启用或触发 `macos-smoke`
 - `test-gateway-e2e.ps1`
@@ -587,12 +568,6 @@ macOS / Linux: ~/.codex-retry-gateway
 - `test-install-restore.ps1`
   - 已通过
   - 验证安装、透传、UI 页面、热更新配置、实时日志、516 统计、恢复闭环
-- `test-client-configs.mjs`
-  - 已通过
-  - 验证 pi、OpenCode、ZCode 配置发现、最小改写、JSONC 注释保留、备份、冲突恢复和 gateway 归属校验
-- `test-client-only-install.mjs`
-  - 已通过
-  - 验证无 Codex 时的 client-only 安装、复用接管新配置、缺失 `config.json` 恢复、管理页恢复和 PowerShell 入口
 - `test-launch-ui.ps1`
   - 已通过
   - 验证首次一键启动自动安装、再次启动自动复用、UI 可访问、默认 `516/1034/1552` 拦截仍生效
@@ -613,3 +588,12 @@ macOS / Linux: ~/.codex-retry-gateway
 - `codex exec` 历史现象
   - gateway 关闭时，真实报错地址为 `http://127.0.0.1:4610/responses`
   - gateway 恢复后，`codex exec` 已再次成功返回 `OK`
+
+## 工程设施
+
+- `.githooks/pre-push`（workskill pre-push gate）
+  - 仓库已配置 `core.hooksPath=.githooks`，push 时自动执行受保护分支（`main`）的推送校验，包括 standalone push 的 `Task:` footer 约束与任务目录校验
+  - 推送被拦截时，按提示补上合规 `Task:` footer 或携带 `WORKSKILL_TASK_ID` / `WORKSKILL_CONVERSATION_ID` 环境变量（workskill 作用域内）后重试
+- `vendor/workskill/browser-lifecycle-runtime/`
+  - 随仓库托管的 workskill 受控浏览器生命周期运行时（`controlled-browser-process` / `controlled-playwright` / watchdog），带 `runtime-manifest.json` 内容摘要校验
+  - 供 workskill 的 UI 验证 / 浏览器自动化流程调用，避免依赖全局安装

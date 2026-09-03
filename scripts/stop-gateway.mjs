@@ -9,7 +9,7 @@ import {
 async function main() {
   const options = parseOptions(process.argv, { booleanFlags: ["quiet"] });
   const message = await stopGateway({
-    stateRoot: options.stateRoot || DEFAULT_STATE_ROOT,
+    stateRoot: options.stateRoot || process.env.STATE_ROOT || DEFAULT_STATE_ROOT,
     quiet: Boolean(options.quiet),
   });
 

@@ -5,9 +5,10 @@ import { createServer } from "node:http";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { spawn } from "node:child_process";
 
-const gatewayEntry = path.resolve(new URL("../gateway.mjs", import.meta.url).pathname);
+const gatewayEntry = fileURLToPath(new URL("../gateway.mjs", import.meta.url));
 const TRANSIENT_RETRY_MAX_ATTEMPTS = 16;
 const STRICT_STREAM_BUFFER_LIMIT_BYTES = 8 * 1024 * 1024;
 

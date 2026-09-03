@@ -14,9 +14,11 @@ import {
 } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import vm from "node:vm";
+import { executeSqliteScript } from "./sqlite-runtime.mjs";
 
-const gatewayRoot = path.resolve(import.meta.dirname, "..");
+const gatewayRoot = path.resolve(fileURLToPath(new URL("..", import.meta.url)));
 const gatewayEntry = path.join(gatewayRoot, "gateway.mjs");
 
 function assert(condition, message) {
@@ -111,6 +113,10 @@ function execFileText(command, args, options = {}) {
       resolve(`${stdout || ""}`);
     });
   });
+}
+
+async function createFixtureDatabase(databasePath, sql, cwd) {
+  await executeSqliteScript(databasePath, sql, { cwd });
 }
 
 function createJsonResponse(res, statusCode, body, extraHeaders = {}) {
@@ -3231,45 +3237,38 @@ async function verifyRenderedUiEvidenceDetailsBehavior(uiHtml) {
 }
 
 async function createHistoricalImportFixtures(tempRoot) {
-  const sqlite3Path = process.env.SQLITE3_EXE || "sqlite3";
   const fixtureRoot = path.join(tempRoot, "historical-import-fixtures");
   const ccSwitchDbPath = path.join(fixtureRoot, "cc-switch.db");
   const codexLogsDbPath = path.join(fixtureRoot, "logs_2.sqlite");
   const sessionsRoot = path.join(fixtureRoot, "sessions");
   await mkdir(sessionsRoot, { recursive: true });
-  await execFileText(
-    sqlite3Path,
+  await createFixtureDatabase(
+    ccSwitchDbPath,
     [
-      ccSwitchDbPath,
-      [
-        "CREATE TABLE proxy_request_logs (",
-        "request_id TEXT, provider_id TEXT, app_type TEXT, model TEXT, request_model TEXT,",
-        "input_tokens INTEGER, output_tokens INTEGER, cache_read_tokens INTEGER, cache_creation_tokens INTEGER,",
-        "input_cost_usd REAL, output_cost_usd REAL, total_cost_usd REAL,",
-        "latency_ms INTEGER, first_token_ms INTEGER, duration_ms INTEGER, status_code INTEGER,",
-        "error_message TEXT, session_id TEXT, provider_type TEXT, is_streaming INTEGER,",
-        "created_at TEXT, data_source TEXT, pricing_model TEXT",
-        ");",
-        "INSERT INTO proxy_request_logs VALUES ('r1','p1','codex','gpt-5.5','gpt-5.5',100,20,5,0,0.01,0.02,0.03,300,120,800,200,NULL,'s1','openai',1,'2026-06-30T10:00:00.000Z','cc-switch','standard');",
-        "INSERT INTO proxy_request_logs VALUES ('r2','p1','codex','gpt-5.4','gpt-5.4',200,10,0,2,0.02,0.01,0.03,900,300,1800,502,'bad upstream','s2','openai',0,'2026-06-30T11:00:00.000Z','cc-switch','standard');",
-      ].join(" "),
-    ],
-    { cwd: fixtureRoot },
+      "CREATE TABLE proxy_request_logs (",
+      "request_id TEXT, provider_id TEXT, app_type TEXT, model TEXT, request_model TEXT,",
+      "input_tokens INTEGER, output_tokens INTEGER, cache_read_tokens INTEGER, cache_creation_tokens INTEGER,",
+      "input_cost_usd REAL, output_cost_usd REAL, total_cost_usd REAL,",
+      "latency_ms INTEGER, first_token_ms INTEGER, duration_ms INTEGER, status_code INTEGER,",
+      "error_message TEXT, session_id TEXT, provider_type TEXT, is_streaming INTEGER,",
+      "created_at TEXT, data_source TEXT, pricing_model TEXT",
+      ");",
+      "INSERT INTO proxy_request_logs VALUES ('r1','p1','codex','gpt-5.5','gpt-5.5',100,20,5,0,0.01,0.02,0.03,300,120,800,200,NULL,'s1','openai',1,'2026-06-30T10:00:00.000Z','cc-switch','standard');",
+      "INSERT INTO proxy_request_logs VALUES ('r2','p1','codex','gpt-5.4','gpt-5.4',200,10,0,2,0.02,0.01,0.03,900,300,1800,502,'bad upstream','s2','openai',0,'2026-06-30T11:00:00.000Z','cc-switch','standard');",
+    ].join(" "),
+    fixtureRoot,
   );
-  await execFileText(
-    sqlite3Path,
+  await createFixtureDatabase(
+    codexLogsDbPath,
     [
-      codexLogsDbPath,
-      [
-        "CREATE TABLE logs (",
-        "id INTEGER, ts TEXT, ts_nanos INTEGER, level TEXT, target TEXT, feedback_log_body TEXT,",
-        "module_path TEXT, file TEXT, line INTEGER, thread_id TEXT, process_uuid TEXT, estimated_bytes INTEGER",
-        ");",
-        "INSERT INTO logs VALUES (1,'2026-06-30T10:00:00.000Z',0,'INFO','codex_core','reasoning_tokens=516 final_answer','m','f',1,'t1','p1',128);",
-        "INSERT INTO logs VALUES (2,'2026-06-30T11:00:00.000Z',0,'ERROR','codex_core','upstream 502','m','f',2,'t1','p1',64);",
-      ].join(" "),
-    ],
-    { cwd: fixtureRoot },
+      "CREATE TABLE logs (",
+      "id INTEGER, ts TEXT, ts_nanos INTEGER, level TEXT, target TEXT, feedback_log_body TEXT,",
+      "module_path TEXT, file TEXT, line INTEGER, thread_id TEXT, process_uuid TEXT, estimated_bytes INTEGER",
+      ");",
+      "INSERT INTO logs VALUES (1,'2026-06-30T10:00:00.000Z',0,'INFO','codex_core','reasoning_tokens=516 final_answer','m','f',1,'t1','p1',128);",
+      "INSERT INTO logs VALUES (2,'2026-06-30T11:00:00.000Z',0,'ERROR','codex_core','upstream 502','m','f',2,'t1','p1',64);",
+    ].join(" "),
+    fixtureRoot,
   );
   await writeFile(
     path.join(sessionsRoot, "large-session.jsonl"),
